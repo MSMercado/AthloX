@@ -1,0 +1,72 @@
+{
+  "expo": {
+    "name": "AthloX",
+    "slug": "athlox",
+    "scheme": "athlox",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0d0d0d"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.athlox.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "AthloX uses your location to track your runs, rides and hikes.",
+        "NSLocationAlwaysUsageDescription": "AthloX uses your location in the background to keep tracking your activity even when the screen is off."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0d0d0d"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.athlox.app",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "AthloX uses your location to track your runs, rides and hikes."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#ff4d00",
+          "sounds": []
+        }
+      ],
+      "expo-web-browser",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "AthloX needs access to your photos to share them in posts and update your profile picture.",
+          "cameraPermission": "AthloX needs camera access to take photos for your posts."
+        }
+      ]
+    ],
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0883018a-28ca-4221-aeef-ad3bbeb977c4"
+      }
+    }
+  }
+}
