@@ -42,6 +42,27 @@ const useStore = create((set, get) => ({
     AsyncStorage.setItem('wb_workoutPlan', JSON.stringify(plan)).catch(e => console.warn('[useStore] storage error:', e?.message));
   },
 
+  // ── Plan Day Completions ─────────────────────────────────────────────────
+  // User-controlled per-day checkmarks for plan workouts.
+  // Shape: { 'YYYY-MM-DD': true } — only stores `true` entries (toggling off
+  // deletes the key) so storage stays compact.
+  planCompletions: {},
+  setPlanCompletions: (completions) => {
+    set({ planCompletions: completions || {} });
+    AsyncStorage.setItem('wb_planCompletions', JSON.stringify(completions || {}))
+      .catch(e => console.warn('[useStore] storage error:', e?.message));
+  },
+  togglePlanCompletion: (dateStr) => {
+    if (!dateStr) return;
+    const cur = get().planCompletions || {};
+    const next = { ...cur };
+    if (next[dateStr]) delete next[dateStr];
+    else next[dateStr] = true;
+    set({ planCompletions: next });
+    AsyncStorage.setItem('wb_planCompletions', JSON.stringify(next))
+      .catch(e => console.warn('[useStore] storage error:', e?.message));
+  },
+
   // ── Scheduled Workouts (from AI Coach) ──
   scheduledWorkouts: [],
   setScheduledWorkouts: (scheduledWorkouts) => {
@@ -75,7 +96,7 @@ const useStore = create((set, get) => ({
   // ── Hydrate from storage ──
   hydrate: async () => {
     try {
-      const [logs, routines, darkMode, workoutPlan, scheduledWorkouts, notifSettings, xp] = await Promise.all([
+      const [logs, routines, darkMode, workoutPlan, scheduledWorkouts, notifSettings, xp, planCompletions] = await Promise.all([
         AsyncStorage.getItem('wb_logs'),
         AsyncStorage.getItem('wb_routines'),
         AsyncStorage.getItem('wb_darkMode'),
@@ -83,6 +104,7 @@ const useStore = create((set, get) => ({
         AsyncStorage.getItem('wb_scheduledWorkouts'),
         AsyncStorage.getItem('wb_notifSettings'),
         AsyncStorage.getItem('wb_xp'),
+        AsyncStorage.getItem('wb_planCompletions'),
       ]);
       set({
         logs:               logs               ? JSON.parse(logs)               : [],
@@ -92,6 +114,7 @@ const useStore = create((set, get) => ({
         scheduledWorkouts:  scheduledWorkouts  ? JSON.parse(scheduledWorkouts)  : [],
         notifSettings:      notifSettings      ? JSON.parse(notifSettings)      : { workout: true, streak: true, coach: false },
         xp:                 xp                 ? JSON.parse(xp)                 : 0,
+        planCompletions:    planCompletions    ? JSON.parse(planCompletions)    : {},
       });
     } catch (e) {
       console.warn('[useStore] hydrate failed:', e?.message);

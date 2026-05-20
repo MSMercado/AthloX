@@ -1,13 +1,14 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
   StyleSheet, Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import useStore from '../store/useStore';
 import useColors from '../lib/useColors';
 import { shadow } from '../lib/theme';
+import { listRunActivities } from '../lib/runActivities';
 
 const { width } = Dimensions.get('window');
 const CHART_W = width - 64;
@@ -239,6 +240,17 @@ export default function ProgressScreen() {
 
   const [period, setPeriod] = useState('7 Days');
 
+  // Recent runs from the run_activities Supabase table — re-fetched whenever
+  // the screen regains focus so a freshly-finished run shows up immediately.
+  const [recentRuns, setRecentRuns] = useState([]);
+  useFocusEffect(useCallback(() => {
+    let cancelled = false;
+    listRunActivities({ limit: 10 })
+      .then(rows => { if (!cancelled) setRecentRuns(rows); })
+      .catch(() => { if (!cancelled) setRecentRuns([]); });
+    return () => { cancelled = true; };
+  }, []));
+
   // ── Computed data ──
   const allTime = useMemo(() => ({
     workouts:  logs.length,
@@ -318,6 +330,47 @@ export default function ProgressScreen() {
                 <StatCard icon="🏅" value={`${streak}d`} label="Streak" sub={`Best: ${longestStreak}d`} colors={colors} accent={colors.green} />
               </View>
             </View>
+
+            {/* ── Recent Runs (re-openable summaries) ── */}
+            {recentRuns.length > 0 && (
+              <View style={[styles.card, { marginBottom: 14 }]}>
+                <Text style={[styles.cardTitle, { color: colors.text }]}>Recent Runs</Text>
+                <Text style={[styles.cardSub, { color: colors.text3 }]}>Tap to view route, splits and AI insights</Text>
+                {recentRuns.map((run, i) => {
+                  const km = (run.distanceKm || 0).toFixed(2);
+                  const mins = Math.round((run.durationSec || 0) / 60);
+                  const pace = run.avgPaceMinPerKm
+                    ? (() => {
+                        const m = Math.floor(run.avgPaceMinPerKm);
+                        const s = Math.round((run.avgPaceMinPerKm - m) * 60);
+                        return `${m}:${String(s).padStart(2, '0')}/km`;
+                      })()
+                    : '—';
+                  const dateStr = new Date(run.startedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                  return (
+                    <TouchableOpacity
+                      key={run.id}
+                      style={[styles.runRow, i > 0 && { borderTopWidth: 1, borderTopColor: colors.border }]}
+                      onPress={() => navigation.navigate('RunSummary', { activityId: run.id })}
+                      activeOpacity={0.7}
+                    >
+                      <View style={[styles.runIcon, { backgroundColor: colors.green + '22' }]}>
+                        <Text style={{ fontSize: 18 }}>🏃</Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.runTitle, { color: colors.text }]} numberOfLines={1}>
+                          {(run.activityType || 'run').charAt(0).toUpperCase() + (run.activityType || 'run').slice(1)} · {km} km
+                        </Text>
+                        <Text style={[styles.runMeta, { color: colors.text3 }]}>
+                          {dateStr} · {mins} min · {pace}
+                        </Text>
+                      </View>
+                      <Text style={[styles.runChevron, { color: colors.text3 }]}>›</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
 
             {/* ── Period selector ── */}
             <View style={[styles.periodRow, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -522,6 +575,12 @@ const makeStyles = (colors) => StyleSheet.create({
   pbIcon:       { fontSize: 20, width: 28, textAlign: 'center' },
   pbLabel:      { flex: 1, fontSize: 14 },
   pbValue:      { fontSize: 16, fontWeight: '800' },
+
+  runRow:       { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12 },
+  runIcon:      { width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  runTitle:     { fontSize: 15, fontWeight: '700' },
+  runMeta:      { fontSize: 12, marginTop: 2 },
+  runChevron:   { fontSize: 22, fontWeight: '300' },
 
   splitRow:     { marginTop: 12, marginBottom: 14 },
   splitBar:     { height: 14, borderRadius: 7, flexDirection: 'row', overflow: 'hidden', backgroundColor: colors.border },

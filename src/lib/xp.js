@@ -19,6 +19,35 @@ export const XP_REWARDS = {
   COMPLETE_WEEK:    150,
 };
 
+// ── Effort-based XP helpers ──────────────────────────────────────────────────
+// Used by TrackScreen so users can't farm XP by starting + stopping immediately.
+// XP is now proportional to actual work done (sets completed / distance / time).
+
+/**
+ * XP for a strength workout. Scales with completion ratio (doneSets / totalSets)
+ * with anti-exploit gates: must take at least 1 minute AND complete >= 25% of sets.
+ */
+export function computeStrengthXP(doneSets, totalSets, elapsedSec) {
+  if (!doneSets || doneSets < 1)   return 0;
+  if (elapsedSec < 60)             return 0;   // less than a minute → likely exploit
+  const ratio = totalSets > 0 ? Math.min(doneSets / totalSets, 1) : 1;
+  if (ratio < 0.25)                return 0;   // less than 25% done → no XP
+  return Math.round(XP_REWARDS.COMPLETE_WORKOUT * ratio);
+}
+
+/**
+ * XP for a cardio activity (run / walk / bike / hike). Composed of distance XP
+ * + a smaller time component. Anti-exploit gates: must move at least 0.5 km
+ * AND last at least 2 minutes (or 5 minutes if distance is short).
+ */
+export function computeCardioXP(distanceKm, elapsedSec) {
+  if (!elapsedSec || elapsedSec < 120)              return 0;  // < 2 min → no XP
+  if (distanceKm < 0.5 && elapsedSec < 300)         return 0;  // short + slow → no XP
+  const distXP = Math.round((distanceKm || 0) * 10);           // 10 XP per km
+  const timeXP = Math.round((elapsedSec / 60) * 1);            // 1 XP per minute
+  return Math.max(distXP + timeXP, 5);                         // floor 5 if past the gate
+}
+
 // Returns full level info for a given XP value
 export function getLevelInfo(xp = 0) {
   let currentIdx = 0;

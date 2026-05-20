@@ -9,10 +9,9 @@ import useStore from '../store/useStore';
 import useColors from '../lib/useColors';
 import { shadow } from '../lib/theme';
 import HeaderActions from '../components/HeaderActions';
+import { supabase } from '../lib/supabase';
 
-// ── Groq API ─────────────────────────────────────────────────────────────────
-const GROQ_KEY  = process.env.EXPO_PUBLIC_GROQ_KEY;
-const GROQ_URL  = 'https://api.groq.com/openai/v1/chat/completions';
+// GROQ is now called via the Supabase Edge Function `groq-proxy` — the API key lives server-side.
 
 const QUICK_SUGGESTIONS = [
   { icon: '💪', text: 'Give me a workout plan for this week' },
@@ -52,11 +51,9 @@ function looksLikePlan(text) {
 
 // Second focused API call: extract structured schedule from readable plan text
 async function extractScheduleFromText(planText, tomorrow) {
-  const res = await fetch(GROQ_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({
-      model: 'llama-3.1-8b-instant',
+  const { data, error } = await supabase.functions.invoke('groq-proxy', {
+    body: {
+      model: 'llama-3.3-70b-versatile',
       messages: [{
         role: 'user',
         content: `You are a JSON extractor. Extract the workout days from the fitness plan below into a JSON array. Rules:
@@ -73,9 +70,9 @@ ${planText.slice(0, 1500)}`,
       }],
       max_tokens: 400,
       temperature: 0,
-    }),
+    },
   });
-  const data = await res.json();
+  if (error) return null;
   const raw = data?.choices?.[0]?.message?.content?.trim() || '[]';
   const cleaned = raw.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/```$/i,'').trim();
   let arr;
@@ -244,26 +241,20 @@ When creating a multi-day workout plan or weekly routine, always name the days c
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
 
     try {
-      const res = await fetch(GROQ_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${GROQ_KEY}`,
-        },
-        body: JSON.stringify({
-          model:       'llama-3.1-8b-instant',
+      const { data, error } = await supabase.functions.invoke('groq-proxy', {
+        body: {
+          model:       'llama-3.3-70b-versatile',
           messages:    [
             { role: 'system', content: buildSystemPrompt() },
             ...history.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
           ],
-          max_tokens:  700,
+          max_tokens:  900,
           temperature: 0.7,
-        }),
+        },
       });
 
-      const data = await res.json();
-
-      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      if (error) throw new Error(error.message || 'Edge function error');
+      if (data?.error) throw new Error(data.error?.message || data.error);
 
       const rawReply = data?.choices?.[0]?.message?.content?.trim() || "Sorry, I couldn't process that. Try again!";
 
@@ -280,7 +271,7 @@ When creating a multi-day workout plan or weekly routine, always name the days c
       }
 
     } catch (err) {
-      console.log('Coach error:', err?.message);
+      if (__DEV__) console.log('Coach error:', err?.message);
       setMessages(prev => [...prev, { role: 'assistant', content: `Sorry, something went wrong: ${err?.message || 'Unknown error'}` }]);
     } finally {
       setLoading(false);

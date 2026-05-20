@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, TextInput,
   StyleSheet, Alert, ActivityIndicator, Modal, Switch, Image,
@@ -6,12 +6,22 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import useStore from '../store/useStore';
 import useColors from '../lib/useColors';
 import { shadow } from '../lib/theme';
 import { applyNotificationSettings, requestNotificationPermission } from '../lib/notifications';
 import { getLevelInfo, LEVELS } from '../lib/xp';
+import {
+  sanitiseUsernameInput, validateUsername,
+  checkUsernameAvailable, setUsername as saveUsernameDB,
+} from '../lib/usernames';
+import appJson from '../../app.json';
+
+// Single source of truth for the displayed app version — reads app.json's
+// expo.version so the Settings screen never drifts from the real build.
+const APP_VERSION = appJson?.expo?.version || '1.0.0';
 
 const LEVEL_COLORS = {
   Beginner:     { bg: '#f0fdf4', text: '#10b981' },
@@ -76,7 +86,7 @@ function WorkoutHistoryItem({ log, colors, styles }) {
 }
 
 // ─── Settings Modal ──────────────────────────────────────────────────────────
-function SettingsModal({ visible, onClose, user, onLogout, loggingOut }) {
+function SettingsModal({ visible, onClose, user, onLogout, loggingOut, onDeleteAccount, deletingAccount }) {
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const { darkMode, toggleDarkMode, notifSettings, setNotifSettings } = useStore();
@@ -212,14 +222,14 @@ function SettingsModal({ visible, onClose, user, onLogout, loggingOut }) {
           {/* App Info */}
           <Text style={styles.settingGroupLabel}>App</Text>
           <View style={styles.settingCard}>
-            <SettingRow icon="📱" label="Version" value="1.0.0" noBorder />
+            <SettingRow icon="📱" label="Version" value={APP_VERSION} noBorder />
           </View>
 
           {/* Danger Zone */}
           <TouchableOpacity
             style={[styles.logoutBtn, loggingOut && { opacity: 0.6 }]}
             onPress={onLogout}
-            disabled={loggingOut}
+            disabled={loggingOut || deletingAccount}
             activeOpacity={0.85}
           >
             {loggingOut
@@ -230,6 +240,21 @@ function SettingsModal({ visible, onClose, user, onLogout, loggingOut }) {
                 </>
             }
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.deleteAccountBtn, deletingAccount && { opacity: 0.6 }]}
+            onPress={onDeleteAccount}
+            disabled={loggingOut || deletingAccount}
+            activeOpacity={0.85}
+          >
+            {deletingAccount
+              ? <ActivityIndicator color="#fff" size="small" />
+              : <Text style={styles.deleteAccountText}>Delete my account</Text>
+            }
+          </TouchableOpacity>
+          <Text style={styles.deleteAccountHint}>
+            Permanently removes your account, posts, photos and progress. This cannot be undone.
+          </Text>
 
           <View style={{ height: 40 }} />
         </ScrollView>
@@ -250,14 +275,66 @@ export default function ProfileScreen() {
   const [loggingOut, setLoggingOut] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [photoUri, setPhotoUri]     = useState(user?.user_metadata?.avatar_url || null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [deletingAccount, setDeletingAccount]     = useState(false);
 
   const meta = user?.user_metadata || {};
   const [name, setName]               = useState(meta.full_name || '');
   const [displayNameEdit, setDisplayNameEdit] = useState(meta.display_name || '');
   const [bio, setBio]                 = useState(meta.bio || '');
 
-  const displayName = meta.display_name || meta.full_name || user?.email?.split('@')[0] || 'Athlete';
-  const username    = '@' + (user?.email?.split('@')[0] || 'user').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const displayName = meta.display_name || meta.full_name || 'Athlete';
+  // v1.2.1 — strictly use the real @username from profiles. No email fallback —
+  // showing @email-prefix leaked email-derived strings into the UI and testers
+  // read it as "the app is showing my email." If the column is NULL, render a
+  // "Pick a username" CTA instead (handled in JSX below).
+  const [profileUsername, setProfileUsername] = useState(null);
+  useEffect(() => {
+    if (!user?.id) return;
+    supabase.from('profiles').select('username').eq('id', user.id).maybeSingle()
+      .then(({ data }) => { if (data?.username) setProfileUsername(data.username); });
+  }, [user?.id]);
+
+  // Username picker modal state
+  const [showUsernamePicker, setShowUsernamePicker] = useState(false);
+  const [usernameDraft, setUsernameDraft]           = useState('');
+  const [usernameStatus, setUsernameStatus]         = useState({ state: 'idle', message: '' });
+  const [savingUsername, setSavingUsername]         = useState(false);
+  useEffect(() => {
+    if (!showUsernamePicker) return;
+    const v = usernameDraft.trim();
+    if (!v) { setUsernameStatus({ state: 'idle', message: '' }); return; }
+    const err = validateUsername(v);
+    if (err) { setUsernameStatus({ state: 'invalid', message: err }); return; }
+    setUsernameStatus({ state: 'checking', message: 'Checking…' });
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      const res = await checkUsernameAvailable(v, user?.id);
+      if (cancelled) return;
+      setUsernameStatus(res.available
+        ? { state: 'available', message: 'Available' }
+        : { state: 'taken',     message: res.reason || 'Already taken' });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [usernameDraft, showUsernamePicker, user?.id]);
+
+  const handleSaveUsername = async () => {
+    if (savingUsername) return;
+    const v = usernameDraft.trim();
+    if (validateUsername(v) || usernameStatus.state !== 'available') return;
+    setSavingUsername(true);
+    const res = await saveUsernameDB(user?.id, v);
+    setSavingUsername(false);
+    if (!res.ok) {
+      Alert.alert('Could not save', res.error || 'Try a different username');
+      return;
+    }
+    setProfileUsername(v);
+    setShowUsernamePicker(false);
+    setUsernameDraft('');
+    setUsernameStatus({ state: 'idle', message: '' });
+  };
   const level       = meta.level || 'Beginner';
   const goals       = meta.goals || [];
   const equipment   = meta.equipment || [];
@@ -307,6 +384,46 @@ export default function ProfileScreen() {
         },
       ]
     );
+  };
+
+  // Open the type-DELETE confirmation modal. The actual deletion happens in
+  // confirmDeleteAccount once the user types the magic word.
+  const handleDeleteAccount = () => {
+    setDeleteConfirmText('');
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDeleteAccount = async () => {
+    if (deleteConfirmText.trim().toUpperCase() !== 'DELETE') return;
+    setDeletingAccount(true);
+    try {
+      // Server-side cascade: removes posts, likes, comments, follows, profile,
+      // photos, and the auth.users row itself.
+      const { data, error } = await supabase.functions.invoke('delete-account', {
+        body: {},
+      });
+      if (error) throw new Error(error.message || 'Server error during deletion');
+      if (data?.error) throw new Error(data.error);
+
+      // Client-side cleanup: wipe AsyncStorage so a future fresh install
+      // (or a re-signup with the same email) starts clean.
+      const keys = await AsyncStorage.getAllKeys();
+      const wbKeys = keys.filter(k => k.startsWith('wb_'));
+      if (wbKeys.length) await AsyncStorage.multiRemove(wbKeys);
+
+      // Sign out — invalidates the session locally. The auth.users row is
+      // already gone server-side so the JWT can't be refreshed anyway.
+      await supabase.auth.signOut();
+
+      // Modal will unmount along with this screen when auth state changes.
+    } catch (e) {
+      setDeletingAccount(false);
+      setShowDeleteConfirm(false);
+      Alert.alert(
+        'Could not delete account',
+        e?.message || 'Something went wrong. Please try again or contact athloxadmin@gmail.com for help.',
+      );
+    }
   };
 
   const pickPhoto = async () => {
@@ -402,7 +519,15 @@ export default function ProfileScreen() {
           ) : (
             <>
               <Text style={styles.displayName}>{displayName}</Text>
-              <Text style={styles.username}>{username}</Text>
+              {profileUsername ? (
+                <Text style={styles.username}>@{profileUsername}</Text>
+              ) : (
+                <TouchableOpacity onPress={() => setShowUsernamePicker(true)} activeOpacity={0.7}>
+                  <Text style={[styles.username, { color: colors.accent, textDecorationLine: 'underline' }]}>
+                    Pick a username
+                  </Text>
+                </TouchableOpacity>
+              )}
               {meta.bio ? <Text style={styles.bio}>{meta.bio}</Text> : null}
               <View style={[styles.levelBadge, { backgroundColor: levelStyle.bg }]}>
                 <Text style={[styles.levelText, { color: levelStyle.text }]}>{level}</Text>
@@ -507,7 +632,133 @@ export default function ProfileScreen() {
         user={user}
         onLogout={handleLogout}
         loggingOut={loggingOut}
+        onDeleteAccount={handleDeleteAccount}
+        deletingAccount={deletingAccount}
       />
+
+      {/* Delete account confirmation — type DELETE to enable the destructive button */}
+      <Modal
+        visible={showDeleteConfirm}
+        animationType="fade"
+        transparent
+        onRequestClose={() => !deletingAccount && setShowDeleteConfirm(false)}
+      >
+        <View style={styles.deleteOverlay}>
+          <View style={[styles.deleteSheet, { backgroundColor: colors.surface }]}>
+            <Text style={[styles.deleteSheetTitle, { color: colors.text }]}>Delete your account?</Text>
+            <Text style={[styles.deleteSheetBody, { color: colors.text2 }]}>
+              This permanently deletes your profile, workouts, runs, posts and photos.{'\n'}
+              <Text style={{ color: colors.red, fontWeight: '700' }}>This cannot be undone.</Text>
+            </Text>
+            <Text style={[styles.deleteSheetLabel, { color: colors.text3 }]}>
+              Type <Text style={{ color: colors.red, fontWeight: '800' }}>DELETE</Text> to confirm
+            </Text>
+            <TextInput
+              style={[styles.deleteSheetInput, { backgroundColor: colors.bg, borderColor: colors.border, color: colors.text }]}
+              value={deleteConfirmText}
+              onChangeText={setDeleteConfirmText}
+              placeholder="DELETE"
+              placeholderTextColor={colors.text3}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              editable={!deletingAccount}
+            />
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+              <TouchableOpacity
+                style={[styles.deleteSheetBtn, { backgroundColor: colors.bg, borderColor: colors.border, borderWidth: 1, flex: 1 }]}
+                onPress={() => setShowDeleteConfirm(false)}
+                disabled={deletingAccount}
+                activeOpacity={0.7}
+              >
+                <Text style={[styles.deleteSheetBtnText, { color: colors.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.deleteSheetBtn,
+                  { backgroundColor: colors.red, flex: 1 },
+                  (deleteConfirmText.trim().toUpperCase() !== 'DELETE' || deletingAccount) && { opacity: 0.4 },
+                ]}
+                onPress={confirmDeleteAccount}
+                disabled={deleteConfirmText.trim().toUpperCase() !== 'DELETE' || deletingAccount}
+                activeOpacity={0.85}
+              >
+                {deletingAccount
+                  ? <ActivityIndicator color="#fff" size="small" />
+                  : <Text style={[styles.deleteSheetBtnText, { color: '#fff' }]}>Delete forever</Text>
+                }
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Username picker — shown when the user has no @username yet */}
+      <Modal
+        visible={showUsernamePicker}
+        animationType="fade"
+        transparent
+        onRequestClose={() => !savingUsername && setShowUsernamePicker(false)}
+      >
+        <View style={styles.deleteOverlay}>
+          <View style={[styles.deleteSheet, { backgroundColor: colors.surface }]}>
+            <Text style={[styles.deleteSheetTitle, { color: colors.text }]}>Pick your @username</Text>
+            <Text style={[styles.deleteSheetBody, { color: colors.text2 }]}>
+              Friends use this to find you. Lowercase letters, numbers, and underscores. 3-20 characters.
+            </Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 12 }}>
+              <Text style={{ color: colors.text2, fontSize: 18, fontWeight: '700', marginRight: 6 }}>@</Text>
+              <TextInput
+                style={[styles.deleteSheetInput, { backgroundColor: colors.bg, borderColor: colors.border, color: colors.text, flex: 1, marginTop: 0 }]}
+                value={usernameDraft}
+                onChangeText={t => setUsernameDraft(sanitiseUsernameInput(t))}
+                placeholder="yourhandle"
+                placeholderTextColor={colors.text3}
+                autoCapitalize="none"
+                autoCorrect={false}
+                editable={!savingUsername}
+                maxLength={20}
+              />
+            </View>
+            {usernameStatus.message ? (
+              <Text style={{
+                marginTop: 8,
+                fontSize: 13,
+                color:
+                  usernameStatus.state === 'available' ? '#10b981' :
+                  usernameStatus.state === 'checking'  ? colors.text3 :
+                  colors.red,
+              }}>
+                {usernameStatus.message}
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+              <TouchableOpacity
+                style={[styles.deleteSheetBtn, { backgroundColor: colors.bg, borderColor: colors.border, borderWidth: 1, flex: 1 }]}
+                onPress={() => setShowUsernamePicker(false)}
+                disabled={savingUsername}
+                activeOpacity={0.7}
+              >
+                <Text style={[styles.deleteSheetBtnText, { color: colors.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.deleteSheetBtn,
+                  { backgroundColor: colors.accent, flex: 1 },
+                  (usernameStatus.state !== 'available' || savingUsername) && { opacity: 0.4 },
+                ]}
+                onPress={handleSaveUsername}
+                disabled={usernameStatus.state !== 'available' || savingUsername}
+                activeOpacity={0.85}
+              >
+                {savingUsername
+                  ? <ActivityIndicator color="#fff" size="small" />
+                  : <Text style={[styles.deleteSheetBtnText, { color: '#fff' }]}>Save</Text>
+                }
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -601,4 +852,18 @@ const makeStyles = (colors) => StyleSheet.create({
   logoutBtn:      { flexDirection: 'row', gap: 8, backgroundColor: '#fef2f2', borderRadius: 16, paddingVertical: 16, alignItems: 'center', justifyContent: 'center', marginTop: 4, marginBottom: 8, borderWidth: 1, borderColor: '#fecaca' },
   logoutIcon:     { fontSize: 18 },
   logoutText:     { color: colors.red, fontSize: 15, fontWeight: '700' },
+
+  deleteAccountBtn:  { backgroundColor: colors.red, borderRadius: 16, paddingVertical: 16, alignItems: 'center', justifyContent: 'center', marginTop: 16, marginBottom: 6 },
+  deleteAccountText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  deleteAccountHint: { color: colors.text3, fontSize: 12, lineHeight: 16, textAlign: 'center', paddingHorizontal: 24 },
+
+  // Delete confirm modal
+  deleteOverlay:     { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  deleteSheet:       { width: '100%', maxWidth: 380, borderRadius: 20, padding: 20 },
+  deleteSheetTitle:  { fontSize: 20, fontWeight: '800', marginBottom: 8 },
+  deleteSheetBody:   { fontSize: 14, lineHeight: 20, marginBottom: 16 },
+  deleteSheetLabel:  { fontSize: 13, fontWeight: '600', marginBottom: 6 },
+  deleteSheetInput:  { borderWidth: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, fontSize: 16, fontWeight: '700', letterSpacing: 1 },
+  deleteSheetBtn:    { borderRadius: 14, paddingVertical: 14, alignItems: 'center', justifyContent: 'center' },
+  deleteSheetBtnText:{ fontSize: 15, fontWeight: '700' },
 });

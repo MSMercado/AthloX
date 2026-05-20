@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useCallback } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
-  StyleSheet, Dimensions, Modal, Image, BackHandler,
+  StyleSheet, Dimensions, Modal, Image, BackHandler, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
@@ -479,12 +479,34 @@ function WeeklyChart({ chart }) {
   );
 }
 
-function LogRow({ log }) {
+function LogRow({ log, navigation }) {
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const isCardio = log.type === 'cardio';
+
+  const handlePress = () => {
+    // Cardio runs with a stored Supabase activity id → open the rich Run Summary
+    // (route map, splits, charts, AI insights). Older logs without a stored id
+    // fall back to a quick Alert with the basic stats.
+    if (isCardio && log.runActivityId) {
+      navigation.navigate('RunSummary', { activityId: log.runActivityId });
+      return;
+    }
+    const lines = [
+      log.duration ? `Duration: ${log.duration} min` : null,
+      log.calories ? `Calories: ${log.calories} kcal` : null,
+      log.distance ? `Distance: ${log.distance} km` : null,
+      log.date     ? `Date: ${log.date}`            : null,
+    ].filter(Boolean).join('\n');
+    Alert.alert(log.routine || 'Workout', lines || 'No additional details for this entry.');
+  };
+
   return (
-    <View style={[styles.card, styles.logRow]}>
+    <TouchableOpacity
+      onPress={handlePress}
+      activeOpacity={0.78}
+      style={[styles.card, styles.logRow]}
+    >
       <View style={[styles.logIcon, { backgroundColor: isCardio ? '#ecfdf5' : colors.accentDim }]}>
         <Text style={{ fontSize: 20 }}>{isCardio ? '🏃' : '💪'}</Text>
       </View>
@@ -493,7 +515,8 @@ function LogRow({ log }) {
         <Text style={styles.logMeta}>{log.duration}min · {log.calories} cal{log.distance ? ` · ${log.distance}km` : ''}</Text>
       </View>
       <Text style={styles.logDate}>{log.date}</Text>
-    </View>
+      <Text style={[styles.chevron, { marginLeft: 6 }]}>›</Text>
+    </TouchableOpacity>
   );
 }
 
@@ -743,7 +766,7 @@ export default function DashboardScreen() {
             </TouchableOpacity>
           </View>
         ) : (
-          logs.slice(0, 5).map(log => <LogRow key={log.id} log={log} />)
+          logs.slice(0, 5).map(log => <LogRow key={log.id} log={log} navigation={navigation} />)
         )}
       </ScrollView>
 

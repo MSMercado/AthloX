@@ -9,8 +9,18 @@ import { supabase } from '../lib/supabase';
 import { signInWithProvider } from '../lib/socialAuth';
 import useColors from '../lib/useColors';
 import useStore from '../store/useStore';
+import {
+  sanitiseUsernameInput,
+  validateUsername,
+  checkUsernameAvailable,
+  defaultUsernameFromEmail,
+} from '../lib/usernames';
 
 const { width } = Dimensions.get('window');
+
+// Social login is disabled for v1.0.0. Re-enable once each provider
+// (Google/Apple/Facebook/X) is properly configured in the Supabase dashboard.
+const SOCIAL_LOGIN_ENABLED = false;
 
 // ── Data ─────────────────────────────────────────────────────────────────────
 
@@ -37,8 +47,12 @@ const ATHLETE_TYPES = [
 ];
 
 const GOALS = [
-  { id: 'run_5k',       emoji: '🏅', label: 'Run my first 5K' },
-  { id: 'run_10k',      emoji: '🏃', label: 'Run 10K or further' },
+  { id: 'run_5k',       emoji: '🏃', label: 'Run my first 5K' },
+  { id: 'run_10k',      emoji: '🏃', label: 'Run a 10K' },
+  { id: 'run_half',     emoji: '🏅', label: 'Run a half marathon' },
+  { id: 'run_marathon', emoji: '🏆', label: 'Run a marathon' },
+  { id: 'crossfit',     emoji: '⚡', label: 'Train CrossFit-style' },
+  { id: 'hyrox',        emoji: '🔥', label: 'Train for Hyrox' },
   { id: 'lose_weight',  emoji: '🔥', label: 'Lose weight & burn fat' },
   { id: 'build_muscle', emoji: '💪', label: 'Build muscle & strength' },
   { id: 'get_fitter',   emoji: '⚡', label: 'Get overall fitter' },
@@ -61,10 +75,10 @@ const LEVELS = [
 const DAYS_OPTIONS = [3, 4, 5, 6];
 
 const EQUIPMENT = [
-  { id: 'none',  emoji: '🏠', label: 'Home / No Equipment', desc: 'Bodyweight only' },
-  { id: 'bands', emoji: '🎽', label: 'Resistance Bands',    desc: 'Portable & effective' },
-  { id: 'dumbs', emoji: '🏋️', label: 'Dumbbells',           desc: 'Home weights setup' },
-  { id: 'gym',   emoji: '🏟️', label: 'Full Gym Access',     desc: 'All equipment available' },
+  { id: 'large_gym',      emoji: '🏟️', label: 'Large Gym',      desc: 'Full fitness clubs' },
+  { id: 'commercial_gym', emoji: '🏋️', label: 'Commercial Gym', desc: 'Compact public gym with basic machines and equipment' },
+  { id: 'garage_gym',     emoji: '🔧', label: 'Garage Gym',     desc: 'Barbells, squat rack, dumbbells, bench' },
+  { id: 'at_home',        emoji: '🏠', label: 'At Home',        desc: 'Limited equipment such as dumbbells, pull-up bar and bench' },
 ];
 
 // ── Plan Preview Builder ──────────────────────────────────────────────────────
@@ -569,7 +583,7 @@ function buildOnboardingPlan(form) {
 
 // ── Main Component ────────────────────────────────────────────────────────────
 
-const TOTAL_STEPS = 7;
+const TOTAL_STEPS = 8;
 
 export default function SignupScreen({ onBack, onSwitch }) {
   const colors = useColors();
@@ -582,12 +596,14 @@ export default function SignupScreen({ onBack, onSwitch }) {
   const [socialErr, setSocialErr] = useState('');
   const [planReady, setPlanReady] = useState(false);
   const [genStep, setGenStep]     = useState(0);
+  const [showPassword, setShowPassword] = useState(false);
+
   const slideAnim  = useRef(new Animated.Value(0)).current;
   const genFadeAnim = useRef(new Animated.Value(0)).current;
 
-  // When user reaches step 5, run the "generating" animation then reveal the plan
+  // When user reaches step 6 (the plan preview step), run the "generating" animation then reveal the plan
   useEffect(() => {
-    if (step !== 5) { setPlanReady(false); setGenStep(0); return; }
+    if (step !== 6) { setPlanReady(false); setGenStep(0); return; }
     setPlanReady(false);
     setGenStep(0);
     genFadeAnim.setValue(0);
@@ -610,15 +626,63 @@ export default function SignupScreen({ onBack, onSwitch }) {
     timeline:    '',
     level:       '',
     daysPerWeek: 4,
-    equipment:   '',
+    equipment:   'garage_gym',
     name:        '',
     email:       '',
     password:    '',
     weight:      '',
     height:      '',
+    username:    '',
   });
 
+  // Username availability state: { state: 'idle'|'checking'|'available'|'taken'|'invalid', message: string }
+  const [usernameStatus, setUsernameStatus] = useState({ state: 'idle', message: '' });
+  // Debounce ref for the live-check fetch
+  const usernameDebounceRef = useRef(null);
+
   const upd = (k, v) => setForm(p => ({ ...p, [k]: v }));
+
+  // Username picker live-availability — debounce by 400ms, then hit Supabase
+  // to see if the chosen handle is already taken. Updates usernameStatus so
+  // the UI can render an inline ✓ / ✕ / spinner.
+  // NOTE: must be declared AFTER `form`, `upd`, and `usernameDebounceRef` —
+  // earlier ordering crashed on app start because the useEffect's deps array
+  // read `form.email` before `form` had been initialized.
+  const onUsernameChange = (raw) => {
+    const cleaned = sanitiseUsernameInput(raw);
+    upd('username', cleaned);
+    // Reset state immediately for snappy UX
+    if (usernameDebounceRef.current) clearTimeout(usernameDebounceRef.current);
+    if (!cleaned) {
+      setUsernameStatus({ state: 'idle', message: '' });
+      return;
+    }
+    const validationErr = validateUsername(cleaned);
+    if (validationErr) {
+      setUsernameStatus({ state: 'invalid', message: validationErr });
+      return;
+    }
+    setUsernameStatus({ state: 'checking', message: 'Checking…' });
+    usernameDebounceRef.current = setTimeout(async () => {
+      const result = await checkUsernameAvailable(cleaned);
+      if (result.available) {
+        setUsernameStatus({ state: 'available', message: 'Available' });
+      } else {
+        setUsernameStatus({ state: 'taken', message: result.reason || 'Already taken' });
+      }
+    }, 400);
+  };
+
+  // Pre-fill the username field from the email prefix when the user reaches
+  // the username step. They can keep the suggestion or type their own.
+  useEffect(() => {
+    if (form.username) return;
+    if (!form.email) return;
+    const suggested = defaultUsernameFromEmail(form.email);
+    if (suggested && !validateUsername(suggested)) {
+      onUsernameChange(suggested);
+    }
+  }, [form.email, step]);
 
   const animateNext = (dir = 1) => {
     slideAnim.setValue(dir * width);
@@ -674,6 +738,7 @@ export default function SignupScreen({ onBack, onSwitch }) {
       await supabase.from('profiles').upsert({
         id:            data.user.id,
         name:          form.name,
+        username:      form.username || null,  // null falls through to ensureProfileComplete auto-gen
         email:         form.email.trim(),
         athlete_type:  form.athleteType,
         goal:          form.goal,
@@ -755,7 +820,57 @@ export default function SignupScreen({ onBack, onSwitch }) {
 
   const steps = [
 
-    // ── Step 0: Identity Hook ───────────────────────────────────────────────
+    // ── Step 0: Name + Body Stats (asked first, before any plan-building questions) ──
+    <View key="intro" style={styles.stepWrap}>
+      <Text style={styles.stepEmoji}>👋</Text>
+      <Text style={styles.stepTitle}>Welcome! Let's start with the basics</Text>
+      <Text style={styles.stepSub}>A few quick details so we can personalise everything to you</Text>
+
+      <TextInput
+        style={styles.input}
+        placeholder="Your full name"
+        placeholderTextColor={colors.text3}
+        value={form.name}
+        onChangeText={v => upd('name', v)}
+        autoCapitalize="words"
+      />
+
+      <Text style={[styles.sectionLabel, { color: colors.text, marginTop: 8 }]}>Your body stats</Text>
+      <Text style={[styles.metricHint, { color: colors.text3 }]}>Helps factor calorie targets & training intensity</Text>
+      <View style={styles.metricRow}>
+        <View style={styles.metricBox}>
+          <Text style={[styles.metricLabel, { color: colors.text3 }]}>Weight</Text>
+          <TextInput
+            style={[styles.metricInput, { color: colors.text }]}
+            placeholder="70"
+            placeholderTextColor={colors.text3}
+            value={form.weight}
+            onChangeText={v => upd('weight', v)}
+            keyboardType="numeric"
+          />
+          <Text style={[styles.metricUnit, { color: colors.text3 }]}>kg</Text>
+        </View>
+        <View style={styles.metricBox}>
+          <Text style={[styles.metricLabel, { color: colors.text3 }]}>Height</Text>
+          <TextInput
+            style={[styles.metricInput, { color: colors.text }]}
+            placeholder="175"
+            placeholderTextColor={colors.text3}
+            value={form.height}
+            onChangeText={v => upd('height', v)}
+            keyboardType="numeric"
+          />
+          <Text style={[styles.metricUnit, { color: colors.text3 }]}>cm</Text>
+        </View>
+      </View>
+
+      <ContinueBtn
+        onPress={next}
+        disabled={!form.name.trim() || !form.weight || !form.height}
+      />
+    </View>,
+
+    // ── Step 1: Identity Hook ───────────────────────────────────────────────
     <View key={0} style={styles.stepWrap}>
       <Text style={styles.stepEmoji}>🏟️</Text>
       <Text style={styles.stepTitle}>What kind of athlete are you?</Text>
@@ -1016,57 +1131,106 @@ export default function SignupScreen({ onBack, onSwitch }) {
       )}
     </View>,
 
-    // ── Step 6: Account + Body Metrics ─────────────────────────────────────
+    // ── Step 7: Username (@handle) — pick before account creation ───────────
+    <View key="username" style={styles.stepWrap}>
+      <Text style={styles.stepEmoji}>✨</Text>
+      <Text style={styles.stepTitle}>Pick your @username</Text>
+      <Text style={styles.stepSub}>How friends will find you on AthloX. Lowercase letters, numbers, and underscores.</Text>
+
+      <View style={styles.usernameRow}>
+        <Text style={styles.usernamePrefix}>@</Text>
+        <TextInput
+          style={styles.usernameInput}
+          placeholder="yourname"
+          placeholderTextColor={colors.text3}
+          value={form.username}
+          onChangeText={onUsernameChange}
+          autoCapitalize="none"
+          autoCorrect={false}
+          maxLength={20}
+        />
+        {usernameStatus.state === 'checking' && (
+          <ActivityIndicator size="small" color={colors.text3} style={{ marginLeft: 8 }} />
+        )}
+        {usernameStatus.state === 'available' && (
+          <Text style={[styles.usernameStatusIcon, { color: '#22c55e' }]}>✓</Text>
+        )}
+        {(usernameStatus.state === 'taken' || usernameStatus.state === 'invalid') && (
+          <Text style={[styles.usernameStatusIcon, { color: '#ef4444' }]}>✕</Text>
+        )}
+      </View>
+
+      {usernameStatus.message ? (
+        <Text style={[
+          styles.usernameStatusText,
+          usernameStatus.state === 'available' && { color: '#22c55e' },
+          (usernameStatus.state === 'taken' || usernameStatus.state === 'invalid') && { color: '#ef4444' },
+          usernameStatus.state === 'checking' && { color: colors.text3 },
+        ]}>
+          {usernameStatus.message}
+        </Text>
+      ) : (
+        <Text style={[styles.usernameStatusText, { color: colors.text3 }]}>
+          3–20 characters · letters, numbers, underscores
+        </Text>
+      )}
+
+      <ContinueBtn
+        onPress={next}
+        disabled={usernameStatus.state !== 'available'}
+      />
+    </View>,
+
+    // ── Step 8: Account (email + password only — name/weight/height already collected in Step 0) ──
     <View key={6} style={styles.stepWrap}>
       <Text style={styles.stepEmoji}>🔐</Text>
-      <Text style={styles.stepTitle}>Create your account</Text>
+      <Text style={styles.stepTitle}>
+        {form.name.trim() ? `Almost there, ${form.name.trim().split(' ')[0]}!` : 'Create your account'}
+      </Text>
       <Text style={styles.stepSub}>Save your plan and start training</Text>
 
-      <TextInput
-        style={styles.input}
-        placeholder="Your full name"
-        placeholderTextColor={colors.text3}
-        value={form.name}
-        onChangeText={v => upd('name', v)}
-        autoCapitalize="words"
-      />
+      {/* Social login — hidden for v1.0.0 until each provider is properly
+          configured in Supabase (Facebook App Review, X paid tier, etc.).
+          To re-enable: flip SOCIAL_LOGIN_ENABLED to true. */}
+      {SOCIAL_LOGIN_ENABLED && (
+        <>
+          <TouchableOpacity
+            style={styles.socialBtn}
+            onPress={() => handleSocial('facebook')}
+            disabled={!!socialLoading}
+            activeOpacity={0.85}
+          >
+            {socialLoading === 'facebook'
+              ? <ActivityIndicator color="#fff" style={{ marginRight: 12 }} />
+              : <Text style={styles.socialBtnIcon}>f</Text>
+            }
+            <Text style={styles.socialBtnText}>Continue with Facebook</Text>
+            <Text style={styles.socialBtnNote}>Instagram</Text>
+          </TouchableOpacity>
 
-      {/* Social login */}
-      <TouchableOpacity
-        style={styles.socialBtn}
-        onPress={() => handleSocial('facebook')}
-        disabled={!!socialLoading}
-        activeOpacity={0.85}
-      >
-        {socialLoading === 'facebook'
-          ? <ActivityIndicator color="#fff" style={{ marginRight: 12 }} />
-          : <Text style={styles.socialBtnIcon}>f</Text>
-        }
-        <Text style={styles.socialBtnText}>Continue with Facebook</Text>
-        <Text style={styles.socialBtnNote}>Instagram</Text>
-      </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.socialBtn, styles.socialBtnX]}
+            onPress={() => handleSocial('twitter')}
+            disabled={!!socialLoading}
+            activeOpacity={0.85}
+          >
+            {socialLoading === 'twitter'
+              ? <ActivityIndicator color="#fff" style={{ marginRight: 12 }} />
+              : <Text style={styles.socialBtnIcon}>𝕏</Text>
+            }
+            <Text style={styles.socialBtnText}>Continue with X</Text>
+            <Text style={styles.socialBtnNote}> </Text>
+          </TouchableOpacity>
 
-      <TouchableOpacity
-        style={[styles.socialBtn, styles.socialBtnX]}
-        onPress={() => handleSocial('twitter')}
-        disabled={!!socialLoading}
-        activeOpacity={0.85}
-      >
-        {socialLoading === 'twitter'
-          ? <ActivityIndicator color="#fff" style={{ marginRight: 12 }} />
-          : <Text style={styles.socialBtnIcon}>𝕏</Text>
-        }
-        <Text style={styles.socialBtnText}>Continue with X</Text>
-        <Text style={styles.socialBtnNote}> </Text>
-      </TouchableOpacity>
+          {!!socialErr && <Text style={styles.socialErrText}>{socialErr}</Text>}
 
-      {!!socialErr && <Text style={styles.socialErrText}>{socialErr}</Text>}
-
-      <View style={styles.divider}>
-        <View style={styles.dividerLine} />
-        <Text style={styles.dividerText}>or sign up with email</Text>
-        <View style={styles.dividerLine} />
-      </View>
+          <View style={styles.divider}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>or sign up with email</Text>
+            <View style={styles.dividerLine} />
+          </View>
+        </>
+      )}
 
       <TextInput
         style={styles.input}
@@ -1077,59 +1241,35 @@ export default function SignupScreen({ onBack, onSwitch }) {
         autoCapitalize="none"
         keyboardType="email-address"
       />
-      <TextInput
-        style={styles.input}
-        placeholder="Password (min 8 characters)"
-        placeholderTextColor={colors.text3}
-        value={form.password}
-        onChangeText={v => upd('password', v)}
-        secureTextEntry
-      />
+      <View style={styles.passwordWrap}>
+        <TextInput
+          style={[styles.input, { paddingRight: 64, marginBottom: 0 }]}
+          placeholder="Password (min 8 characters)"
+          placeholderTextColor={colors.text3}
+          value={form.password}
+          onChangeText={v => upd('password', v)}
+          secureTextEntry={!showPassword}
+        />
+        <TouchableOpacity
+          style={styles.passwordToggle}
+          onPress={() => setShowPassword(s => !s)}
+          activeOpacity={0.7}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          <Text style={styles.passwordToggleText}>
+            {showPassword ? 'Hide' : 'Show'}
+          </Text>
+        </TouchableOpacity>
+      </View>
       {form.password.length > 0 && form.password.length < 8 && (
         <Text style={styles.passwordError}>Password must be at least 8 characters</Text>
       )}
 
-      {/* Body metrics — used to personalise calorie & pace zones */}
-      <Text style={[styles.sectionLabel, { color: colors.text, marginTop: 8 }]}>Your body stats</Text>
-      <Text style={[styles.metricHint, { color: colors.text3 }]}>Helps factor calorie targets into your plan</Text>
-      <View style={styles.metricRow}>
-        <View style={styles.metricBox}>
-          <Text style={[styles.metricLabel, { color: colors.text3 }]}>Weight</Text>
-          <TextInput
-            style={[styles.metricInput, { color: colors.text }]}
-            placeholder="70"
-            placeholderTextColor={colors.text3}
-            value={form.weight}
-            onChangeText={v => upd('weight', v)}
-            keyboardType="numeric"
-          />
-          <Text style={[styles.metricUnit, { color: colors.text3 }]}>kg</Text>
-        </View>
-        <View style={styles.metricBox}>
-          <Text style={[styles.metricLabel, { color: colors.text3 }]}>Height</Text>
-          <TextInput
-            style={[styles.metricInput, { color: colors.text }]}
-            placeholder="175"
-            placeholderTextColor={colors.text3}
-            value={form.height}
-            onChangeText={v => upd('height', v)}
-            keyboardType="numeric"
-          />
-          <Text style={[styles.metricUnit, { color: colors.text3 }]}>cm</Text>
-        </View>
-      </View>
-
       <ContinueBtn
         onPress={finish}
         label="Start Training →"
-        disabled={!form.name.trim() || !form.email.trim() || form.password.length < 8}
+        disabled={!form.email.trim() || form.password.length < 8}
       />
-      <TouchableOpacity
-        onPress={() => { if (form.name.trim() && form.email.trim() && form.password.length >= 8) finish(); }}
-        style={styles.skipBtn}
-      >
-        <Text style={styles.skipText}>Skip body stats for now</Text>
-      </TouchableOpacity>
     </View>,
   ];
 
@@ -1319,6 +1459,16 @@ const makeStyles = (colors) => StyleSheet.create({
 
   // Input
   input:            { backgroundColor: colors.surface, borderRadius: 16, padding: 16, fontSize: 16, color: colors.text, marginBottom: 12, borderWidth: 1, borderColor: colors.border },
+
+  // Username picker (step 7 of onboarding)
+  usernameRow:      { flexDirection: 'row', alignItems: 'center', backgroundColor: colors.surface, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 4, borderWidth: 1, borderColor: colors.border, marginBottom: 8 },
+  usernamePrefix:   { fontSize: 22, fontWeight: '800', color: colors.text3, marginRight: 4 },
+  usernameInput:    { flex: 1, fontSize: 18, fontWeight: '700', color: colors.text, paddingVertical: 14, letterSpacing: 0.3 },
+  usernameStatusIcon:{ fontSize: 20, fontWeight: '900', marginLeft: 8 },
+  usernameStatusText:{ fontSize: 13, marginBottom: 20, marginLeft: 4 },
+  passwordWrap:     { position: 'relative', marginBottom: 12 },
+  passwordToggle:   { position: 'absolute', right: 12, top: 0, bottom: 0, justifyContent: 'center', paddingHorizontal: 8 },
+  passwordToggleText:{ fontSize: 13, fontWeight: '600', color: colors.accent },
   passwordError:    { fontSize: 13, color: '#ef4444', marginTop: -8, marginBottom: 12, paddingHorizontal: 4 },
   metricHint:       { fontSize: 13, marginBottom: 12, marginTop: -8 },
 

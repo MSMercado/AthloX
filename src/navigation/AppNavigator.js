@@ -12,6 +12,8 @@ import ProgressScreen   from '../screens/ProgressScreen';
 import SocialScreen     from '../screens/SocialScreen';
 import ProfileScreen    from '../screens/ProfileScreen';
 import CoachScreen      from '../screens/CoachScreen';
+import RunSummaryScreen from '../screens/RunSummaryScreen';
+import CircuitTimerScreen from '../screens/CircuitTimerScreen';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -88,9 +90,11 @@ function MainTabs() {
 export default function AppNavigator() {
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }}>
-      <Stack.Screen name="Main"     component={MainTabs}      />
-      <Stack.Screen name="Profile"  component={ProfileScreen} />
-      <Stack.Screen name="Progress" component={ProgressScreen} />
+      <Stack.Screen name="Main"        component={MainTabs}        />
+      <Stack.Screen name="Profile"     component={ProfileScreen}   />
+      <Stack.Screen name="Progress"    component={ProgressScreen}  />
+      <Stack.Screen name="RunSummary"   component={RunSummaryScreen}/>
+      <Stack.Screen name="CircuitTimer" component={CircuitTimerScreen}/>
     </Stack.Navigator>
   );
 }

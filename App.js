@@ -6,6 +6,8 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { supabase } from './src/lib/supabase';
 import useStore from './src/store/useStore';
 import { colors, lightColors, darkColors } from './src/lib/theme';
+import { ensureProfileComplete } from './src/lib/community';
+import { drainPendingRuns } from './src/lib/runActivities';
 import {
   requestNotificationPermission,
   applyNotificationSettings,
@@ -40,13 +42,31 @@ export default function App() {
             );
           }
         });
+        // Backfill profile.name from auth metadata if missing — patches accounts
+        // created before the signup flow reliably upserted into profiles.
+        ensureProfileComplete(session.user).catch(e =>
+          console.warn('[App] ensureProfileComplete failed:', e?.message)
+        );
+        // Drain any runs that failed to save while offline. Safe no-op when
+        // the queue is empty. Runs already-saved retry get filtered server-side.
+        drainPendingRuns().catch(e =>
+          console.warn('[App] drainPendingRuns failed:', e?.message)
+        );
       }
     });
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
       setUser(session?.user ?? null);
-      if (session) setAuthState('app');
+      if (session) {
+        setAuthState('app');
+        ensureProfileComplete(session.user).catch(e =>
+          console.warn('[App] ensureProfileComplete failed:', e?.message)
+        );
+        drainPendingRuns().catch(e =>
+          console.warn('[App] drainPendingRuns failed:', e?.message)
+        );
+      }
     });
 
     return () => listener.subscription.unsubscribe();

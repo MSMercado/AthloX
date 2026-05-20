@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import {
-  View, Text, ScrollView, TouchableOpacity,
+  View, Text, ScrollView, TouchableOpacity, TextInput,
   StyleSheet, Modal, ActivityIndicator, Alert, BackHandler,
   Animated, PanResponder,
 } from 'react-native';
@@ -12,27 +12,86 @@ import { shadow } from '../lib/theme';
 import HeaderActions from '../components/HeaderActions';
 import { EXERCISES } from '../data/exercises';
 import { TUTORIALS } from '../data/exerciseTutorials';
+import { supabase } from '../lib/supabase';
+import { generatePlan } from '../lib/planGenerator';
+import { goalHasAnyScaffold } from '../data/planScaffolds';
 
-// Name-based tutorial lookup — plan exercises from AI have names but no numeric IDs
-const TUTORIALS_BY_NAME = {};
+// Name-based tutorial lookup — plan exercises from AI have names but no numeric IDs.
+// LLM-generated names often add modifiers ("Barbell Bench Press", "Dumbbell Shoulder Press",
+// "Wide-Grip Pull-Ups") that don't match the canonical exercise list verbatim, so we use
+// normalized + token-overlap matching as a fallback.
+const STOP_TOKENS = new Set([
+  'the','a','an','and','or','with','to','for','of','on','in','at',
+  'standing','seated','lying','kneeling','single','double','one','two','both',
+]);
+const normalizeName = (s) =>
+  (s || '')
+    .toLowerCase()
+    .replace(/[\(\)\[\]]/g, ' ')
+    .replace(/[-_/]/g, ' ')
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+const tokenizeName = (s) =>
+  normalizeName(s).split(' ').filter(t => t && !STOP_TOKENS.has(t));
+
+// Build lookup tables
+const TUTORIALS_BY_NAME = {};       // exact normalized → tutorial
+const TUTORIAL_ENTRIES  = [];       // [{ tutorial, tokens }] for fuzzy fallback
 EXERCISES.forEach(ex => {
   if (TUTORIALS[ex.id]) {
-    TUTORIALS_BY_NAME[ex.name.toLowerCase()] = TUTORIALS[ex.id];
+    const norm = normalizeName(ex.name);
+    TUTORIALS_BY_NAME[norm] = TUTORIALS[ex.id];
+    TUTORIAL_ENTRIES.push({
+      tutorial: TUTORIALS[ex.id],
+      name: ex.name,
+      tokens: tokenizeName(ex.name),
+    });
   }
 });
-const getPlanTutorial = (name) =>
-  TUTORIALS_BY_NAME[name?.toLowerCase()] || null;
 
-const GROQ_KEY = process.env.EXPO_PUBLIC_GROQ_KEY;
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const getPlanTutorial = (name) => {
+  if (!name) return null;
+  // 1. Exact normalized match
+  const norm = normalizeName(name);
+  if (TUTORIALS_BY_NAME[norm]) return TUTORIALS_BY_NAME[norm];
+
+  // 2. Token overlap — find the tutorial whose tokens overlap most with the input
+  const inputTokens = new Set(tokenizeName(name));
+  if (inputTokens.size === 0) return null;
+  let best = null;
+  let bestScore = 0;
+  for (const entry of TUTORIAL_ENTRIES) {
+    if (entry.tokens.length === 0) continue;
+    const matched = entry.tokens.filter(t => inputTokens.has(t)).length;
+    // Require either: all canonical tokens appear in input (canonical is subset),
+    // OR all input tokens appear in canonical (input is subset)
+    const canonicalCovered = matched / entry.tokens.length;
+    const inputCovered     = matched / inputTokens.size;
+    const score = Math.max(canonicalCovered, inputCovered);
+    if (score >= 0.75 && score > bestScore) {
+      best = entry.tutorial;
+      bestScore = score;
+    }
+  }
+  return best;
+};
+
+// GROQ is now called via the Supabase Edge Function `groq-proxy` — the API key lives server-side.
 
 const GOALS = [
-  { id: 'lose_fat',     label: 'Lose Fat',            icon: '🔥', desc: 'Burn calories & reduce body fat' },
-  { id: 'build_muscle', label: 'Build Muscle',         icon: '💪', desc: 'Increase muscle mass & size' },
-  { id: 'get_strong',   label: 'Get Stronger',         icon: '🏋️', desc: 'Increase strength & power' },
-  { id: 'endurance',    label: 'Improve Endurance',    icon: '🏃', desc: 'Run longer & last further' },
-  { id: 'athletic',     label: 'Athletic Performance', icon: '🥇', desc: 'Train like a competitive athlete' },
-  { id: 'general',      label: 'General Fitness',      icon: '⚡', desc: 'Overall health & wellness' },
+  { id: 'lose_fat',     label: 'Lose Fat',             icon: '🔥', desc: 'Burn calories & reduce body fat' },
+  { id: 'build_muscle', label: 'Build Muscle',          icon: '💪', desc: 'Increase muscle mass & size' },
+  { id: 'get_strong',   label: 'Get Stronger',          icon: '🏋️', desc: 'Increase strength & power' },
+  { id: 'run_5k',       label: 'Run a 5K',              icon: '🏃', desc: 'Build up to 5 km / 3.1 mi' },
+  { id: 'run_10k',      label: 'Run a 10K',             icon: '🏃', desc: 'Build up to 10 km / 6.2 mi' },
+  { id: 'run_half',     label: 'Run a Half Marathon',   icon: '🏅', desc: 'Train for 21.1 km / 13.1 mi' },
+  { id: 'run_marathon', label: 'Run a Marathon',        icon: '🏆', desc: 'Train for 42.2 km / 26.2 mi' },
+  { id: 'crossfit',     label: 'Train CrossFit',        icon: '⚡', desc: 'AMRAPs, EMOMs, chippers — functional fitness' },
+  { id: 'hyrox',        label: 'Train for Hyrox',       icon: '🔥', desc: 'Sled push, farmer carry, ski erg, run intervals' },
+  { id: 'endurance',    label: 'Improve Endurance',     icon: '🫁', desc: 'Build cardio for any sport' },
+  { id: 'athletic',     label: 'Athletic Performance',  icon: '🥇', desc: 'Train like a competitive athlete' },
+  { id: 'general',      label: 'General Fitness',       icon: '⚡', desc: 'Overall health & wellness' },
 ];
 
 const DURATIONS = [
@@ -50,6 +109,49 @@ const DAYS_PER_WEEK = [
 ];
 
 const DAY_ORDER = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
+// ── LLM JSON Sanitizer ────────────────────────────────────────────────────────
+// LLMs occasionally sometimes return JSON with raw U+0000..U+001F
+// control characters inside string values (e.g. a literal newline in a
+// "coachNote"). Strict JSON.parse throws "U+0000 thru U+001F is not allowed
+// in string". This walks the text once, detects when we're inside a string
+// literal, and escapes any stray control chars it finds. Structural whitespace
+// (newlines/tabs between tokens) is preserved.
+function sanitizeLlmJson(s) {
+  let out = '';
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const code = c.charCodeAt(0);
+    if (escape) {
+      out += c;
+      escape = false;
+      continue;
+    }
+    if (c === '\\' && inString) {
+      out += c;
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      out += c;
+      continue;
+    }
+    if (inString && code < 0x20) {
+      if (c === '\n')      out += '\\n';
+      else if (c === '\r') out += '\\r';
+      else if (c === '\t') out += '\\t';
+      else if (c === '\b') out += '\\b';
+      else if (c === '\f') out += '\\f';
+      else                 out += '\\u' + code.toString(16).padStart(4, '0');
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
 
 // ── Date Helpers ──────────────────────────────────────────────────────────────
 
@@ -70,6 +172,98 @@ function addDays(date, n) {
 
 function fmtShort(date) {
   return date.toLocaleDateString('en-US', { day: 'numeric', month: 'short' }).toUpperCase();
+}
+
+// Day type display helpers — keep in sync with the prompt's day type taxonomy.
+// Returns { emoji, label, accentColor } for a given day, used by the day cards
+// and detail screen to render circuit-style days (CrossFit / Hyrox) distinctly
+// from strength / running days.
+function dayTypeMeta(day, colors) {
+  if (!day) return null;
+  const t = (day.type || '').toLowerCase();
+  if (t === 'crossfit')  return { emoji: '⚡', label: 'CrossFit',  accent: '#a855f7', isCircuit: true };
+  if (t === 'hyrox')     return { emoji: '🔥', label: 'Hyrox',     accent: '#ef4444', isCircuit: true };
+  if (t === 'mobility')  return { emoji: '🧘', label: 'Mobility',  accent: '#22c55e', isCircuit: false };
+  if (t === 'run' || t === 'cardio')
+                          return { emoji: '🏃', label: 'Cardio',    accent: colors?.green || '#22c55e', isCircuit: false };
+  if (t === 'rest')      return { emoji: '😴', label: 'Rest',      accent: colors?.border || '#999', isCircuit: false };
+  // Default: strength / workout
+  return { emoji: '💪', label: 'Strength', accent: colors?.accent || '#ff6b00', isCircuit: false };
+}
+
+// Heuristic detector: is this day a heavy lower-body / leg session?
+// Looks at the focus string and exercise muscle/name fields.
+function isLegDay(day) {
+  if (!day || day.type === 'rest') return false;
+  const focus = (day.focus || '').toLowerCase();
+  if (/leg|lower|squat|deadlift|glute|quad|hamstring/.test(focus)) return true;
+  const exercises = Array.isArray(day.exercises) ? day.exercises : [];
+  return exercises.some(ex => {
+    const name = (ex?.name || '').toLowerCase();
+    const muscle = (ex?.muscle || '').toLowerCase();
+    return /squat|deadlift|lunge|leg press|leg curl|leg extension|hip thrust|glute|calf raise/.test(name)
+        || /legs|glutes|quads|hamstrings|calves/.test(muscle);
+  });
+}
+
+// Heuristic detector: is this day a running / cardio session?
+function isRunDay(day) {
+  if (!day || day.type === 'rest') return false;
+  if (day.type === 'run' || day.type === 'cardio') return true;
+  const focus = (day.focus || '').toLowerCase();
+  return /\brun\b|running|jog|sprint|tempo|interval|long run/.test(focus);
+}
+
+// Returns the index + direction of the first ordering conflict in a schedule,
+// or null. Considers the schedule cyclic (Sunday → Monday across week boundaries).
+//   { idx, kind: 'leg-then-run' }  — heavier guard, running on fatigued legs
+//   { idx, kind: 'run-then-leg' }  — softer guard, heavy legs after a hard run
+function findOrderingConflict(schedule) {
+  if (!Array.isArray(schedule) || schedule.length < 2) return null;
+  for (let i = 0; i < schedule.length; i++) {
+    const cur = schedule[i];
+    const next = schedule[(i + 1) % schedule.length];
+    if (isLegDay(cur) && isRunDay(next)) return { idx: i, kind: 'leg-then-run' };
+    if (isRunDay(cur) && isLegDay(next)) return { idx: i, kind: 'run-then-leg' };
+  }
+  return null;
+}
+
+// Auto-fix leg↔run adjacency by swapping in a rest day. Used when the LLM
+// produces a plan that ignores the sequencing rule (it sometimes does despite
+// the explicit prompt instruction). Bounded to 7 iterations since there are
+// only 7 days. Day labels are reassigned by position after swapping so the
+// schedule stays Mon-Sun in storage.
+function fixOrderingConflicts(schedule) {
+  if (!Array.isArray(schedule) || schedule.length < 2) return schedule;
+  const fixed = schedule.map(d => ({ ...d }));
+  for (let iter = 0; iter < 7; iter++) {
+    const conflict = findOrderingConflict(fixed);
+    if (!conflict) break;
+    const nextIdx = (conflict.idx + 1) % fixed.length;
+    // Find a rest day elsewhere we can swap into nextIdx (pushing the
+    // conflicting day out of harm's way). Skip the conflict positions.
+    let restIdx = -1;
+    for (let i = 0; i < fixed.length; i++) {
+      if (i === conflict.idx || i === nextIdx) continue;
+      if (fixed[i]?.type === 'rest') { restIdx = i; break; }
+    }
+    if (restIdx === -1) break; // no rest available — give up gracefully
+    [fixed[restIdx], fixed[nextIdx]] = [fixed[nextIdx], fixed[restIdx]];
+  }
+  // Re-stamp day labels by position so storage stays Mon-Sun aligned.
+  return fixed.map((d, i) => ({ ...d, day: DAY_ORDER[i] || d.day }));
+}
+
+// Local-time YYYY-MM-DD key for the planCompletions store. Using local instead of
+// UTC so a workout marked "today" near midnight stays attached to the user's
+// calendar day, not UTC's.
+function formatDateKey(date) {
+  if (!(date instanceof Date) || isNaN(date)) return null;
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 function getCurrentWeekNum(plan) {
@@ -164,14 +358,35 @@ function ExerciseTutorialModal({ exName, onClose }) {
                 )}
               </>
             ) : (
-              /* No tutorial in DB — show a friendly fallback */
-              <View style={[styles.tutFallback, { backgroundColor: colors.bg }]}>
-                <Text style={{ fontSize: 44, marginBottom: 14 }}>💪</Text>
-                <Text style={[styles.tutFallbackTitle, { color: colors.text }]}>{exName}</Text>
-                <Text style={[styles.tutFallbackSub, { color: colors.text2 }]}>
-                  Ask your AI Coach for a full breakdown of this exercise — tap the Coach tab and type "{exName} how to do it".
-                </Text>
-              </View>
+              /* No tutorial in DB — show universal form cues + Coach CTA */
+              <>
+                <View style={styles.tutSteps}>
+                  <Text style={[styles.tutStepsTitle, { color: colors.text }]}>General form cues</Text>
+                  {[
+                    'Warm up the working muscles before starting your first heavy set.',
+                    'Move through a full range of motion — quality reps over quantity.',
+                    'Control the eccentric (lowering) phase — about 2 seconds down, 1 second up.',
+                    'Breathe out on the exertion (the hard part), in on the return.',
+                    'Rest 60–90 seconds between sets for hypertrophy, 2–3 minutes for strength.',
+                  ].map((step, i) => (
+                    <View key={i} style={styles.tutStep}>
+                      <View style={[styles.tutStepNum, { backgroundColor: colors.accent }]}>
+                        <Text style={styles.tutStepNumText}>{i + 1}</Text>
+                      </View>
+                      <Text style={[styles.tutStepText, { color: colors.text }]}>{step}</Text>
+                    </View>
+                  ))}
+                </View>
+                <View style={[styles.tutTip, { backgroundColor: colors.accentDim }]}>
+                  <Text style={styles.tutTipIcon}>💡</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.tutTipLabel, { color: colors.accent }]}>Want a deeper breakdown?</Text>
+                    <Text style={[styles.tutTipText, { color: colors.text }]}>
+                      Open the AI Coach tab and ask: "How do I do {exName}?" — you'll get step-by-step instructions tailored to your level.
+                    </Text>
+                  </View>
+                </View>
+              </>
             )}
 
             <TouchableOpacity
@@ -191,7 +406,7 @@ function ExerciseTutorialModal({ exName, onClose }) {
 // ── Full-screen Workout Detail View ──────────────────────────────────────────
 // Replaces the whole screen — no Modal issues on Android
 
-function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, onStart }) {
+function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, useLlmProgression = false, progressionNote = null, onStart }) {
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const [tutorialEx, setTutorialEx] = useState(null); // exercise name string
@@ -199,12 +414,22 @@ function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, onStart })
   if (!workout) return null;
 
   const isRest       = workout.type === 'rest';
-  const isCardio     = workout.type === 'cardio';
+  const isCardio     = workout.type === 'cardio' || workout.type === 'run';
   const isCoachItem  = !!workout.isCoachItem;
+  // v1.1.0 — circuit-style days (CrossFit / Hyrox) render exercises as a
+  // movement list with reps only (no sets), under a prominent "format" header.
+  const dayMeta      = dayTypeMeta(workout, colors);
+  const isCircuit    = !!dayMeta?.isCircuit;
+  const isMobility   = workout.type === 'mobility';
   const phase        = (weekNum && totalWeeks) ? getPhase(weekNum, totalWeeks) : null;
-  const accentCol    = isCardio ? colors.green : colors.accent;
+  const accentCol    = isCardio ? colors.green : (dayMeta?.accent || colors.accent);
   const baseExercises = workout.exercises || [];
-  const exercises    = (phase && !isCardio && !isCoachItem)
+  // v1.1.0+ plans: the LLM provides phase-specific exercises with the right
+  // sets/reps already, so skip the mechanical progression. Legacy plans (no
+  // phases array) still get the old +set/+rep bump per Build/Peak phase.
+  // Circuit days also skip mechanical progression (their structure is fixed
+  // by the format, not adjustable via "+1 set in Build phase").
+  const exercises    = (phase && !isCardio && !isCircuit && !isCoachItem && !useLlmProgression)
     ? applyProgression(baseExercises, phase)
     : baseExercises;
   const dateLabel    = dayDate
@@ -236,13 +461,20 @@ function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, onStart })
           {!isRest && (
             <View style={[styles.dsPill, { backgroundColor: accentCol + '22', borderColor: accentCol + '55' }]}>
               <Text style={[styles.dsPillText, { color: accentCol }]}>
-                {isCoachItem ? '✨ Coach' : isCardio ? '🏃 Cardio' : '💪 Strength'}
+                {isCoachItem ? '✨ Coach' : `${dayMeta?.emoji || '💪'} ${dayMeta?.label || 'Strength'}`}
               </Text>
+            </View>
+          )}
+          {!isRest && !!workout.format && (
+            <View style={[styles.dsPill, { backgroundColor: accentCol + '12', borderColor: accentCol + '44' }]}>
+              <Text style={[styles.dsPillText, { color: accentCol, fontWeight: '800' }]}>{workout.format}</Text>
             </View>
           )}
           {!isRest && exercises.length > 0 && (
             <View style={[styles.dsPill, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-              <Text style={[styles.dsPillText, { color: colors.text2 }]}>{exercises.length} exercises</Text>
+              <Text style={[styles.dsPillText, { color: colors.text2 }]}>
+                {exercises.length} {isCircuit ? 'movements' : 'exercises'}
+              </Text>
             </View>
           )}
           {!isRest && (
@@ -314,58 +546,83 @@ function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, onStart })
         ) : (
           /* ── PLAN WORKOUT EXERCISES ── */
           <View style={styles.dsExSection}>
-            {/* Progressive overload guidance */}
+            {/* Progressive overload guidance — LLM-provided per-week note for v1.1.0+
+                plans, or the legacy mechanical tip for older plans. */}
             {phase && !isCardio && (
               <View style={[styles.phaseBox, { backgroundColor: phase.color + '15', borderColor: phase.color + '44' }]}>
                 <View style={[styles.phaseDot, { backgroundColor: phase.color }]} />
                 <View style={{ flex: 1 }}>
-                  <Text style={[styles.phaseBoxLabel, { color: phase.color }]}>Week {weekNum} — {phase.label} Phase</Text>
-                  <Text style={[styles.phaseBoxTip, { color: colors.text2 }]}>{phase.tip}</Text>
+                  <Text style={[styles.phaseBoxLabel, { color: phase.color }]}>
+                    Week {weekNum}{progressionNote ? '' : ` — ${phase.label} Phase`}
+                  </Text>
+                  <Text style={[styles.phaseBoxTip, { color: colors.text2 }]}>
+                    {progressionNote || phase.tip}
+                  </Text>
                 </View>
               </View>
             )}
-            <Text style={[styles.dsExSectionLabel, { color: colors.text3 }]}>EXERCISES</Text>
-            {exercises.map((ex, i) => (
-              <View
-                key={i}
-                style={[styles.dsExCard, { backgroundColor: colors.surface, borderColor: colors.border }]}
-              >
-                {/* Number badge */}
-                <View style={[styles.dsExNum, { backgroundColor: accentCol + '22' }]}>
-                  <Text style={[styles.dsExNumText, { color: accentCol }]}>{i + 1}</Text>
-                </View>
-
+            <Text style={[styles.dsExSectionLabel, { color: colors.text3 }]}>
+              {isCircuit ? 'MOVEMENTS' : 'EXERCISES'}
+            </Text>
+            {/* Circuit-day banner: explicit instruction so the user knows how to read the list */}
+            {isCircuit && (
+              <View style={[styles.phaseBox, { backgroundColor: accentCol + '12', borderColor: accentCol + '44', marginBottom: 14 }]}>
+                <View style={[styles.phaseDot, { backgroundColor: accentCol }]} />
                 <View style={{ flex: 1 }}>
-                  {/* Name row with ⓘ button */}
-                  <View style={styles.dsExNameRow}>
-                    <Text style={[styles.dsExName, { color: colors.text, flex: 1 }]}>{ex.name}</Text>
-                    <TouchableOpacity
-                      style={[styles.dsInfoBtn, { backgroundColor: accentCol + '18', borderColor: accentCol + '44' }]}
-                      onPress={() => setTutorialEx(ex.name)}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={[styles.dsInfoBtnText, { color: accentCol }]}>ⓘ</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  {/* Chips row */}
-                  <View style={styles.dsChipRow}>
-                    <View style={[styles.dsChip, { backgroundColor: colors.bg, borderColor: colors.border }]}>
-                      <Text style={[styles.dsChipLabel, { color: colors.text3 }]}>SETS</Text>
-                      <Text style={[styles.dsChipVal, { color: colors.text }]}>{ex.sets}</Text>
-                    </View>
-                    <View style={[styles.dsChip, { backgroundColor: colors.bg, borderColor: colors.border }]}>
-                      <Text style={[styles.dsChipLabel, { color: colors.text3 }]}>REPS</Text>
-                      <Text style={[styles.dsChipVal, { color: colors.text }]}>{ex.reps}</Text>
-                    </View>
-                    <View style={[styles.dsChip, { backgroundColor: colors.bg, borderColor: colors.border }]}>
-                      <Text style={[styles.dsChipLabel, { color: colors.text3 }]}>REST</Text>
-                      <Text style={[styles.dsChipVal, { color: colors.text }]}>{ex.rest}</Text>
-                    </View>
-                  </View>
+                  <Text style={[styles.phaseBoxLabel, { color: accentCol }]}>{workout.format || 'Circuit'}</Text>
+                  <Text style={[styles.phaseBoxTip, { color: colors.text2 }]}>
+                    {workout.type === 'crossfit'
+                      ? 'Complete all movements in order, then repeat for the duration / round count above.'
+                      : 'Move through each station in sequence with minimal rest. Hyrox-style functional fitness.'}
+                  </Text>
                 </View>
               </View>
-            ))}
+            )}
+            {exercises.map((ex, i) => {
+              // Build chips list dynamically based on what fields the exercise actually has.
+              // Strength typically has sets/reps/rest; circuit has reps or distance/weight;
+              // mobility has duration. We only render chips for present fields.
+              const chips = [];
+              if (ex.sets != null && !isCircuit)         chips.push(['SETS',     String(ex.sets)]);
+              if (ex.reps != null)                       chips.push(['REPS',     String(ex.reps)]);
+              if (ex.distance != null)                   chips.push(['DISTANCE', String(ex.distance)]);
+              if (ex.weight   != null)                   chips.push(['WEIGHT',   String(ex.weight)]);
+              if (ex.duration != null)                   chips.push(['DURATION', String(ex.duration)]);
+              if (ex.pace     != null)                   chips.push(['PACE',     String(ex.pace)]);
+              if (ex.rest     != null && !isCircuit)     chips.push(['REST',     String(ex.rest)]);
+              return (
+                <View
+                  key={i}
+                  style={[styles.dsExCard, { backgroundColor: colors.surface, borderColor: colors.border }]}
+                >
+                  <View style={[styles.dsExNum, { backgroundColor: accentCol + '22' }]}>
+                    <Text style={[styles.dsExNumText, { color: accentCol }]}>{i + 1}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={styles.dsExNameRow}>
+                      <Text style={[styles.dsExName, { color: colors.text, flex: 1 }]}>{ex.name}</Text>
+                      <TouchableOpacity
+                        style={[styles.dsInfoBtn, { backgroundColor: accentCol + '18', borderColor: accentCol + '44' }]}
+                        onPress={() => setTutorialEx(ex.name)}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={[styles.dsInfoBtnText, { color: accentCol }]}>ⓘ</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {chips.length > 0 && (
+                      <View style={styles.dsChipRow}>
+                        {chips.map(([label, value], j) => (
+                          <View key={j} style={[styles.dsChip, { backgroundColor: colors.bg, borderColor: colors.border }]}>
+                            <Text style={[styles.dsChipLabel, { color: colors.text3 }]}>{label}</Text>
+                            <Text style={[styles.dsChipVal, { color: colors.text }]}>{value}</Text>
+                          </View>
+                        ))}
+                      </View>
+                    )}
+                  </View>
+                </View>
+              );
+            })}
           </View>
         )}
       </ScrollView>
@@ -375,7 +632,28 @@ function WorkoutDetailScreen({ workout, dayDate, weekNum, totalWeeks, onStart })
         <View style={[styles.dsFooter, { backgroundColor: colors.bg, borderTopColor: colors.border }]}>
           <TouchableOpacity
             style={[styles.dsStartBtn, { backgroundColor: accentCol }]}
-            onPress={onStart}
+            onPress={() => {
+              // Build a routine object the Workout tab can consume.
+              // Strength days get the progression-applied exercises so the user
+              // actually lifts the right sets/reps for their current phase.
+              // Circuit days (CrossFit / Hyrox) and mobility don't fit the strength
+              // tracker — for v1.1.0 we treat them as cardio-style timer sessions
+              // so the user gets a stopwatch + the movement list to follow.
+              const routineType = isCardio || isCircuit || isMobility
+                ? 'cardio'
+                : 'strength';
+              const routine = {
+                name: workout.name || workout.focus || 'Workout',
+                exercises,
+                duration: estMins,
+                type: routineType,
+                format: workout.format || null,
+                dayType: workout.type || null,
+                color: accentCol,
+                generated: !!workout.generated,
+              };
+              onStart(routine);
+            }}
             activeOpacity={0.85}
           >
             <Text style={styles.dsStartBtnText}>▶  Start Workout</Text>
@@ -405,6 +683,7 @@ function CreatePlanModal({ visible, onClose, onCreated }) {
   const [goal, setGoal]           = useState(null);
   const [duration, setDuration]   = useState(12);
   const [daysPerWk, setDaysPerWk] = useState(4);
+  const [currentCap, setCurrentCap] = useState('');
 
   const meta      = user?.user_metadata || {};
   const level     = meta.level      || user?.level      || 'Beginner';
@@ -414,7 +693,22 @@ function CreatePlanModal({ visible, onClose, onCreated }) {
   const userGoals = (meta.goals     || []).join(', ') || 'general fitness';
   const firstName = (meta.full_name || user?.name || 'Athlete').split(' ')[0];
 
-  const reset = () => { setStep(0); setGoal(null); setDuration(12); setDaysPerWk(4); };
+  const reset = () => { setStep(0); setGoal(null); setDuration(12); setDaysPerWk(4); setCurrentCap(''); };
+
+  // Goal-aware placeholder for the "current capability" step
+  const capabilityPlaceholder = (() => {
+    if (!goal) return 'e.g. "I bench 60kg for 5 reps and run 5km in 30 min"';
+    const g = goal.toLowerCase();
+    if (g.includes('marathon') || g.includes('5k') || g.includes('10k') || g.includes('half'))
+      return 'e.g. "Last 5K was 28:00. Currently running 25 km/week, longest run 8 km."';
+    if (g.includes('strong') || g.includes('muscle') || g.includes('lift'))
+      return 'e.g. "Bench 70kg x 5, Squat 90kg x 5, Deadlift 110kg x 3"';
+    if (g.includes('endurance'))
+      return 'e.g. "Can hold 6:00/km pace for 5 km. Cycling 30 min @ moderate effort."';
+    if (g.includes('athletic'))
+      return 'e.g. "Vertical jump 60cm, 40-yd dash 5.0s, 5-rep max bench 80kg"';
+    return 'e.g. "Workout 3x/week. Comfortable with 30-minute sessions. 5 push-ups in a row."';
+  })();
   const close = () => { reset(); onClose(); };
 
   const levelGuidelines = level.toLowerCase().includes('beginner')
@@ -432,7 +726,7 @@ function CreatePlanModal({ visible, onClose, onCreated }) {
 - Include heavy compound lifts, complex movements, and high-intensity techniques
 - Sets: 4–5. Rep ranges vary (3–6 strength, 8–12 hypertrophy, 15–20 endurance). Rest: 45–60 seconds`;
 
-  const buildPrompt = () => `You are an elite personal trainer. Create a ${duration}-week workout plan for ${firstName}.
+  const buildPrompt = () => `You are an elite personal trainer. Create a ${duration}-week PHASED workout plan for ${firstName}.
 
 User profile:
 - Fitness level: ${level}
@@ -442,63 +736,329 @@ User profile:
 - Existing goals: ${userGoals}
 - Selected plan goal: ${goal}
 - Training days per week: ${daysPerWk}
+- Current capability: ${currentCap?.trim() || 'not specified — assume typical for the fitness level above'}
 
 ${levelGuidelines}
 
-Design a realistic, progressive, professional plan. Distribute exactly ${daysPerWk} workout days across the week, the remaining days are rest or active recovery. For each workout day include 4–6 exercises strictly appropriate for the user's level and equipment above.
+CRITICAL — produce a REAL progressive program with WEEK-TO-WEEK variation, not the same week repeated:
 
-Respond with ONLY a valid JSON object, no markdown fences, no extra text:
+1. Split the plan into PHASES that together cover weeks 1 through ${duration} with no gaps and no overlaps. The number of phases scales with the total duration — longer plans require more phases AND more deload weeks scattered throughout, not just one giant phase repeated.
+
+   PHASE COUNT BY DURATION (use this as your guide):
+   - 4-6 weeks: 2-3 phases (e.g. Foundation → Build, with optional 1-week Deload at the end)
+   - 8-12 weeks (≈ 3 months): 3-4 phases, including at least one Deload week (e.g. Foundation → Build → Deload → Peak)
+   - 16-24 weeks (≈ 4-6 months): 4-6 phases with TWO deload weeks scattered through the program — one mid-program (around week 8-10) and one before final Peak (e.g. Foundation → Build 1 → Deload → Build 2 → Deload → Peak)
+   - 36-52 weeks (≈ 9 months to 1 year): 6-9 phases organised as mesocycles. Insert a deload week roughly every 4-5 weeks of hard training. Treat this like multiple complete training blocks back-to-back, each with its own progression arc. Example for a 52-week plan: Foundation → Hypertrophy 1 → Deload → Strength 1 → Deload → Power → Deload → Hypertrophy 2 → Deload → Strength 2 → Deload → Peak → Active Recovery
+   - For very long plans (≥ 6 months), the LATER phases must use noticeably DIFFERENT exercise selections from the earlier phases so the program never feels stale — a year of identical squat variants is worse than a year of varied lower-body work.
+
+   Goal-specific structures (apply within the phase count above):
+   - Strength/hypertrophy: Foundation → Build → Deload → Peak (repeat the cycle for plans ≥ 16 weeks with fresh exercises each cycle)
+   - Running 5K: Base Build → Speed/Tempo → Race Prep → Taper
+   - Running 10K: Base Build → Threshold → Long Run Focus → Taper
+   - Running Half Marathon: Base Build → Tempo & Long Runs → Race Prep → Taper
+   - Running Marathon: Base Build → Long Run Build → Peak Long Runs → Taper
+   - Long-duration running plans (24+ weeks): repeat base-build cycles with a key race / time trial at the end of each, then taper into the final goal race.
+
+2. EACH PHASE has DIFFERENT exercise variants from other phases — phase-to-phase rotation. For example:
+   - Foundation: Bench Press, Back Squat, Conventional Deadlift
+   - Build: Incline DB Press, Front Squat, Romanian Deadlift
+   - Peak: Close-Grip Bench, Pause Squat, Deficit Deadlift
+
+3. WITHIN EACH PHASE, also vary exercises week-to-week so weeks don't feel repetitive. Provide 2-3 \`scheduleVariants\` per phase that the user rotates through. Each variant keeps the SAME muscle-group focus on the same day (Mon = chest/shoulders/triceps, Tue = legs, etc.) but uses DIFFERENT specific exercises AND a DIFFERENT \`focus\` label that reflects what's distinctive about that variant. Example for Foundation phase Monday push session:
+   - Variant A focus: "Push: Bench Strength" — Bench Press, Overhead Press, Tricep Pushdowns, Dips
+   - Variant B focus: "Push: Incline & Volume" — Incline DB Press, DB Shoulder Press, Skullcrushers, Pike Push-ups
+   - Variant C focus: "Push: Close-Grip Focus" — Close-Grip Bench, Arnold Press, Diamond Push-ups, Cable Chest Fly
+   IMPORTANT: every variant on the same weekday MUST have a DIFFERENT \`focus\` string — never repeat "Upper Body Push" across all variants. The focus label is what the user sees on the day card; identical labels make weeks feel the same even when exercises differ. The app alternates variants automatically (Week 1 = A, Week 2 = B, Week 3 = A, etc.). Two variants is the minimum; three is ideal for phases of 4+ weeks.
+
+   For RUNNING days, the same rule applies — vary the focus label too:
+   - Variant A: "Easy Run", Variant B: "Tempo Run", Variant C: "Interval Session"
+   - Or for long-run days: Variant A: "Long Run · 8 km", Variant B: "Long Run · 10 km Progressive"
+
+4. EACH WEEK has a specific concrete progression note — what to DO this week vs last. Be specific:
+   - "Add 5 lbs to all main lifts vs last week"
+   - "Add 1 rep per set if all sets felt RPE ≤ 8"
+   - "Long run: 12 km easy pace"
+   - "DELOAD: drop all loads 30-40%, reduce sets by 1, focus on form"
+
+   MANDATORY: Every week (except Week 1 of a phase) MUST contain at least 2 of these progression mechanics relative to the previous week:
+   - Increase reps (e.g., 10 → 12)
+   - Increase sets (e.g., 3 → 4)
+   - Reduce rest time (e.g., 60s → 45s)
+   - Introduce or extend tempo (e.g., 3-second eccentric)
+   - Add isometric/pause holds (e.g., 2-sec pause at bottom)
+   - Swap an exercise for a harder progression in the same movement pattern
+   Identical workouts across weeks are FORBIDDEN. Even within a single phase, the user must see progression.
+
+5. MOVEMENT-PATTERN VARIATION CHAINS — when picking exercises for variants and across phases, follow disciplined progressions in each pattern. These are concrete chains you should draw from (and extend with similar logic for other patterns):
+
+   Upper Push (chest/shoulders/triceps):
+   DB Floor Press → Incline DB Press → Tempo Bench Press → Alternating DB Press → Close-Grip Bench → Pause Bench
+   Push-up → Wide Push-up → Decline Push-up → Tempo Push-up → Archer Push-up → Diamond Push-up
+
+   Upper Pull (back/biceps):
+   Supported Row → Bent-Over Row → Single-Arm Row → Tempo Row → Chest-Supported Row → Pendlay Row
+   Inverted Row → Banded Pull-up → Negative Pull-up → Pull-up → Chin-up → Weighted Pull-up
+
+   Lower (legs/glutes):
+   Goblet Squat → Tempo Goblet Squat → Pause Goblet Squat → Front Squat → Bulgarian Split Squat → Pause Back Squat
+   Romanian Deadlift → Single-Leg RDL → Tempo RDL → Conventional Deadlift → Deficit Deadlift → Pause Deadlift
+
+   Core:
+   Knee Plank → Plank → Side Plank → Shoulder-Tap Plank → Dead Bug → Hollow Hold → Dragon Flag
+
+   Running:
+   Easy Run (Z2) → Easy + Strides → Tempo Run → Threshold Intervals → VO2 Max Intervals → Long Run with Surges
+
+   Variation must feel INTENTIONAL — pick the next exercise in the same movement family that matches the user's level. Don't randomly swap unrelated movements.
+
+6. PERSONALIZATION VOICE — when writing weekProgressions notes and the coachNote, address the user directly and reference their progression:
+   - "Based on your Foundation phase, your bench should feel ready for +5 lbs this week."
+   - "You're ready to progress from goblet squats to Bulgarian split squats — your single-leg stability is built."
+   - NOT: "The athlete should add weight." (third person, generic)
+
+5. For RUNNING goals, structure phases with progressive long-run distance and a TAPER phase in the final 1-2 weeks. Each variant for a running day can vary the workout TYPE (easy run / tempo / intervals / long run) week-to-week.
+
+6. For STRENGTH/PHYSIQUE goals, include a DELOAD week roughly every 4-5 weeks (between Build and Peak, or as its own short phase).
+
+7. EXERCISE SEQUENCING — NEVER schedule a running day (type "run" or any day with running/cardio focus) on the day immediately AFTER a heavy lower-body / leg day. Running on fatigued legs increases injury risk and undermines both sessions. Always insert at least one rest day or upper-body day between a leg session and a run session. The same applies in reverse: avoid heavy legs the day after a long run.
+
+8. DAY TYPE TAXONOMY — choose the most accurate \`type\` for each day. Use the right format for each:
+   - "strength" — traditional sets × reps (e.g. "Bench Press 3x8 @ 90s rest"). Each exercise has \`sets\` (number) and \`reps\` (string).
+   - "run" — running session. Exercise list typically has 1 entry like { "name": "Easy Run", "duration": "30 min", "pace": "easy" } or { "name": "Long Run", "distance": "12 km", "pace": "easy" }.
+   - "crossfit" — circuit-style. Day MUST include a \`format\` field at the day level (e.g. "AMRAP 12 min", "5 Rounds For Time", "EMOM 10 min", "21-15-9 Chipper"). Exercises in the day list the movements that make up ONE round, with \`reps\` per movement (no \`sets\` — the round count comes from the format). Example exercise: { "name": "Wall Balls", "reps": "15" } or { "name": "Box Jumps", "reps": "12 (24 in/20 in)" }.
+   - "hyrox" — Hyrox-style functional fitness. Day MUST include \`format\` like "Hyrox Workout" or "Compromised Cardio Circuit". Exercises are stations like { "name": "Sled Push", "distance": "20 m", "weight": "moderate" }, { "name": "Farmer Carry", "distance": "100 m", "weight": "2 × 24kg KB" }, { "name": "Burpee Broad Jumps", "reps": "20" }, { "name": "Ski Erg", "distance": "500 m" }, { "name": "Wall Balls", "reps": "30 (9 kg)" }.
+   - "mobility" — short recovery / stretch session. Exercises like { "name": "Hip 90/90", "duration": "2 min/side" }.
+   - "rest" — full rest day, exercises array is empty.
+
+9. PLAN VARIETY — when the user's training styles include "CrossFit" or "Hyrox", or the goal is athletic/general fitness with broad equipment, mix in 1-2 crossfit or hyrox days per week instead of straight strength sessions. Don't make every day strength — variety drives engagement.
+
+10. GOAL-DRIVEN PLAN STRUCTURE — the SELECTED PLAN GOAL dictates the primary modality of the plan. Don't generate a generic strength plan and sprinkle in goal-specific bits. Build the plan around the goal:
+
+    - "Run a 5K" / "Run a 10K" / "Run a Half Marathon" / "Run a Marathon":
+      MOST workout days MUST be type "run" — at least 60-75% of training days. For a ${daysPerWk}-day plan, that means approximately ${Math.max(1, Math.ceil(daysPerWk * 0.7))} of the workout days are running.
+      Running session types must VARY across the week and across phases: easy/Z2 runs, tempo runs, threshold intervals, hill repeats, long runs (key session per week), occasional fartlek or stride sessions. Don't just write "Easy Run" five days in a row.
+      Include AT MOST 1 strength day per week, and that day should be SHORT (30-45 min), focused on runner-supporting work: posterior chain (RDLs, glute bridges, single-leg work), core stability, calf strength. NO marathon-style "leg day" with heavy squats — it'll wreck the next day's run.
+      For shorter distances (5K/10K), bias toward speed and tempo work; for longer (half/marathon), bias toward weekly long runs that progress over time.
+      Phases follow race-prep arc: Base Build → Tempo/Threshold → Race Pace / Peak Long Runs → Taper.
+      ZERO non-running, non-strength days unless the user picks ≥ 6 days/week (then optionally one mobility/cross-training day).
+
+    - "Train CrossFit":
+      MOST workout days should be type "crossfit" with proper formats (AMRAP, EMOM, "X Rounds For Time", chippers like 21-15-9). Include 1 strength day per week for accessory work, 1-2 rest/mobility days, no traditional running days unless the user requested running.
+
+    - "Train for Hyrox":
+      MOST workout days should mix type "hyrox" (station circuits with sled push, farmer carry, wall balls, burpee broad jumps, ski erg, etc.) with type "run" (race-pace intervals + long easy runs — Hyrox is half running). Include 1 strength day per week focused on legs/core. Phases should reflect Hyrox race prep (Base → Threshold → Race Pace → Taper).
+
+    - "Improve Endurance":
+      Mix of running, cycling, or rowing days at varied intensities. Up to 1 strength day per week is fine.
+
+    - For any goal, don't override with generic strength weeks just because the level is Beginner — instead, use SCALED movements for that goal (shorter runs, banded pull-ups instead of muscle-ups, lighter sled, etc.).
+
+Each variant's schedule must include exactly ${daysPerWk} workout days; the remaining days must be type "rest" with empty exercises array (7 entries total Monday-Sunday). Each workout day has 4-6 exercises appropriate for the user's level and equipment. THIS IS NOT OPTIONAL — fewer than 4 exercises per workout day makes the plan feel empty and is the #1 user complaint. Crossfit and Hyrox days must also list 4-6 movements/stations per day.
+
+Respond with ONLY a valid JSON object (no markdown fences):
+
 {
-  "planName": "descriptive name",
+  "planName": "concise descriptive name",
   "goal": "${goal}",
   "durationWeeks": ${duration},
   "daysPerWeek": ${daysPerWk},
-  "weeklySchedule": [
+  "phases": [
     {
-      "day": "Monday",
-      "type": "workout",
-      "focus": "e.g. Upper Body Push",
-      "exercises": [
-        { "name": "Exercise", "sets": 3, "reps": "8-12", "rest": "60s" }
+      "name": "Foundation",
+      "startWeek": 1,
+      "endWeek": 4,
+      "focus": "what this phase builds, 1 short sentence",
+      "scheduleVariants": [
+        {
+          "schedule": [
+            {
+              "day": "Monday",
+              "type": "strength",
+              "focus": "Push: Bench Strength",
+              "exercises": [
+                { "name": "Bench Press",        "sets": 4, "reps": "6-8",  "rest": "120s" },
+                { "name": "Overhead Press",     "sets": 3, "reps": "8-10", "rest": "90s"  },
+                { "name": "Incline DB Press",   "sets": 3, "reps": "10-12","rest": "75s"  },
+                { "name": "Cable Triceps Push", "sets": 3, "reps": "12-15","rest": "60s"  },
+                { "name": "Lateral Raise",      "sets": 3, "reps": "12-15","rest": "60s"  }
+              ]
+            },
+            {
+              "day": "Tuesday",
+              "type": "crossfit",
+              "focus": "AMRAP — Pull & Push",
+              "format": "AMRAP 15 min",
+              "exercises": [
+                { "name": "Pull-ups",       "reps": "8"  },
+                { "name": "Push-ups",       "reps": "12" },
+                { "name": "Air Squats",     "reps": "15" },
+                { "name": "KB Swings",      "reps": "20 (16 kg)" },
+                { "name": "Box Jumps",      "reps": "10 (24 in/20 in)" }
+              ]
+            },
+            { "day": "Wednesday", "type": "rest", "focus": "Rest", "exercises": [] }
+          ]
+        },
+        {
+          "schedule": [
+            {
+              "day": "Monday",
+              "type": "strength",
+              "focus": "Push: Incline & Volume",
+              "exercises": [
+                { "name": "Incline Barbell Press", "sets": 4, "reps": "8-10", "rest": "90s" },
+                { "name": "Dumbbell Bench Press",  "sets": 3, "reps": "10-12","rest": "75s" },
+                { "name": "Cable Fly",             "sets": 3, "reps": "12-15","rest": "60s" },
+                { "name": "Overhead Triceps Ext.", "sets": 3, "reps": "10-12","rest": "60s" },
+                { "name": "Front Raise",           "sets": 3, "reps": "12-15","rest": "60s" }
+              ]
+            },
+            { "day": "Tuesday", "type": "rest", "focus": "Rest", "exercises": [] }
+          ]
+        }
+      ],
+      "weekProgressions": [
+        "Week 1: Light loads (60% RPE). Master form. 3x8 (Variant A).",
+        "Week 2: Slight load increase, fresh exercises. 3x8 (Variant B).",
+        "Week 3: Continue progression, +5 lbs or +1 rep. 3x9 (Variant A).",
+        "Week 4: Final week of Foundation. 3x10 (Variant B)."
+      ],
+      "progressionTagsByWeek": [
+        ["Form focus", "Foundation"],
+        ["New variation", "Same loads"],
+        ["+1 rep", "+5 lbs"],
+        ["+2 reps", "Tempo added"]
       ]
-    },
-    {
-      "day": "Tuesday",
-      "type": "rest",
-      "focus": "Rest & Recovery",
-      "exercises": []
     }
   ],
-  "progression": "Week-by-week progression instructions",
   "coachNote": "Motivating personal message to ${firstName}"
-}`;
+}
+
+ABSOLUTE REQUIREMENTS:
+- phases must collectively cover every week from 1 through ${duration}, with no gaps and no overlaps.
+- For plans ≥ 12 weeks, the program MUST contain at least one explicit Deload phase (1 week, type "deload" or named "Deload") between hard phases.
+- For plans ≥ 24 weeks, the program MUST contain TWO or more deload weeks distributed through the duration (not all clustered at the end).
+- For plans ≥ 36 weeks, exercise selection in the second half of the program must look noticeably DIFFERENT from the first half — different primary lifts, different running structure — so the user is not doing the same workout in week 30 that they did in week 5.
+- EACH phase MUST have a scheduleVariants array with 2-3 entries (not just one).
+- Each variant's schedule has ${daysPerWk} workout days plus rest days (7 entries total Monday-Sunday).
+- Variants on the same weekday MUST use DIFFERENT \`focus\` strings (e.g. "Push: Bench Strength" vs "Push: Incline & Volume", NEVER both labeled "Upper Body Push"). Same muscle group, different focus emphasis.
+- Variants within a phase use DIFFERENT specific exercises.
+- weekProgressions must have exactly (endWeek - startWeek + 1) entries — one per week in that phase.
+- progressionTagsByWeek must also have (endWeek - startWeek + 1) entries — each entry is an array of 2-3 SHORT punchy tags (≤14 chars each) that summarise what changed that week. Examples: "+1 rep", "+5 lbs", "Tempo added", "Less rest", "New variation", "Form focus", "Deload", "Pause added", "Hold +2s". User sees these as small badges in the UI.
+- Exercise variants must DIFFER between phases (phase-to-phase rotation) AND between variants within a phase (week-to-week variety).
+- IDENTICAL WEEKS ARE FORBIDDEN — every week from Week 2 onwards must apply at least 2 progression mechanics from rule #4 vs the previous week. The variant rotation alone is NOT enough; there must be progression in load/reps/sets/tempo/rest too.`;
+
+  // One attempt at calling Groq + parsing JSON. Returns parsed plan or throws.
+  // v1.3.0 will replace this with the hybrid template + LLM personalization
+  // architecture (small prompt fills exercises into pre-built scaffolds).
+  const callPlanLlm = async () => {
+    const isCircuitGoal = /crossfit|hyrox/i.test(goal || '');
+    const maxTokens =
+      duration >= 36         ? 24000 :
+      duration >= 16         ? 16000 :
+      isCircuitGoal          ? 14000 :
+                                10000;
+    const { data, error } = await supabase.functions.invoke('groq-proxy', {
+      body: {
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: buildPrompt() }],
+        max_tokens: maxTokens,
+        temperature: 0.3,
+        // JSON mode — forces valid JSON output. Eliminates malformed-JSON parse failures.
+        response_format: { type: 'json_object' },
+      },
+    });
+    if (error) throw new Error(error.message || 'Edge function error');
+    if (data?.error) throw new Error(data.error?.message || data.error);
+
+    const raw = data?.choices?.[0]?.message?.content?.trim() || '';
+    if (!raw) throw new Error('Empty response from AI');
+
+    // Strip any stray markdown fences (response_format should prevent them, but be defensive)
+    const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
+    // Escape raw control chars (U+0000..U+001F) inside string literals before strict parse
+    const sanitized = sanitizeLlmJson(cleaned);
+    let plan;
+    try {
+      plan = JSON.parse(sanitized);
+    } catch (parseErr) {
+      // Log the raw response so we can diagnose what the LLM actually produced
+      // (truncation, missing closing brace, etc.). Common on CrossFit / Hyrox
+      // plans where the per-day JSON is denser.
+      console.warn('[plan-gen] JSON parse failed. Response length:', raw.length, 'tail:', raw.slice(-200));
+      throw new Error('Plan response was incomplete — JSON parse failed. Try again, or pick a shorter duration.');
+    }
+
+    // Normalize the plan:
+    //  1. Sort phases by startWeek
+    //  2. Auto-fix leg↔run adjacency in every schedule (LLM doesn't always obey
+    //     the prompt rule on its own)
+    //  3. Backfill the legacy weeklySchedule field from phase 1's first variant
+    if (Array.isArray(plan.phases) && plan.phases.length > 0) {
+      plan.phases.sort((a, b) => (a.startWeek || 1) - (b.startWeek || 1));
+      plan.phases.forEach(phase => {
+        if (Array.isArray(phase.scheduleVariants)) {
+          phase.scheduleVariants.forEach(v => {
+            if (Array.isArray(v?.schedule)) v.schedule = fixOrderingConflicts(v.schedule);
+          });
+        }
+        if (Array.isArray(phase.schedule)) {
+          phase.schedule = fixOrderingConflicts(phase.schedule);
+        }
+      });
+      if (!Array.isArray(plan.weeklySchedule) || plan.weeklySchedule.length === 0) {
+        const p0 = plan.phases[0];
+        plan.weeklySchedule =
+          p0.scheduleVariants?.[0]?.schedule
+          || p0.schedule
+          || [];
+      }
+    } else if (!Array.isArray(plan.weeklySchedule)) {
+      plan.weeklySchedule = [];
+    }
+    // Also fix the top-level weeklySchedule (legacy plans, or our backfill above)
+    if (Array.isArray(plan.weeklySchedule) && plan.weeklySchedule.length > 0) {
+      plan.weeklySchedule = fixOrderingConflicts(plan.weeklySchedule);
+    }
+    return plan;
+  };
 
   const generate = async () => {
-    setStep(3);
-    try {
-      const res = await fetch(GROQ_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
-        body: JSON.stringify({
-          model: 'llama-3.1-8b-instant',
-          messages: [{ role: 'user', content: buildPrompt() }],
-          max_tokens: 2500,
-          temperature: 0.4,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+    setStep(4);
+    let lastErr = null;
+    // v1.3.0 — uses the hybrid template generator. The old callPlanLlm /
+    // buildPrompt path is kept above for reference (and as a fallback while
+    // we expand scaffold coverage) but is no longer the default path.
+    const goalEntry = GOALS.find(g => g.label === goal);
+    const goalId    = goalEntry?.id || null;
+    const rawEquipment = Array.isArray(meta.equipment) ? meta.equipment : [];
 
-      const raw     = data?.choices?.[0]?.message?.content?.trim() || '';
-      const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
-      const plan    = JSON.parse(cleaned);
-      plan.startDate = new Date().toISOString();
-      onCreated(plan);
-      close();
-    } catch (err) {
-      Alert.alert('Error generating plan', err?.message || 'Try again');
-      setStep(2);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const plan = await generatePlan({
+          goal, goalId, duration, daysPerWeek: daysPerWk,
+          level: (level || '').toLowerCase(),
+          equipment: rawEquipment,
+          firstName,
+        });
+        onCreated(plan);
+        close();
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Retry only on transient LLM failures (the coach-note call). Missing
+        // scaffold or other deterministic errors should fail fast.
+        const msg = err?.message || '';
+        const isTransient =
+          msg.includes('JSON') ||
+          msg.includes('Empty response') ||
+          msg.includes('Edge function error') ||
+          msg.includes('timeout');
+        if (!isTransient) break;
+      }
     }
+    Alert.alert('Error generating plan', lastErr?.message || 'Try again');
+    setStep(3);
   };
 
   return (
@@ -508,7 +1068,7 @@ Respond with ONLY a valid JSON object, no markdown fences, no extra text:
         <View style={[styles.modalSheet, { backgroundColor: colors.surface }]}>
           <View style={[styles.modalHandle, { backgroundColor: colors.border }]} />
 
-          {step === 3 ? (
+          {step === 4 ? (
             <View style={styles.loadingState}>
               <ActivityIndicator size="large" color={colors.accent} />
               <Text style={[styles.loadingTitle, { color: colors.text }]}>Building your plan…</Text>
@@ -519,7 +1079,7 @@ Respond with ONLY a valid JSON object, no markdown fences, no extra text:
           ) : (
             <>
               <View style={styles.stepRow}>
-                {[0,1,2].map(i => (
+                {[0,1,2,3].map(i => (
                   <View key={i} style={[styles.stepDot, { backgroundColor: i <= step ? colors.accent : colors.border }]} />
                 ))}
               </View>
@@ -529,7 +1089,9 @@ Respond with ONLY a valid JSON object, no markdown fences, no extra text:
                   <Text style={[styles.wizardTitle, { color: colors.text }]}>What's your main goal?</Text>
                   <Text style={[styles.wizardSub, { color: colors.text2 }]}>Your plan will be built around this</Text>
                   <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 380 }}>
-                    {GOALS.map(g => (
+                    {/* Only show goals that actually have a plan scaffold — the
+                        user should never pick a goal then hit a dead end. */}
+                    {GOALS.filter(g => goalHasAnyScaffold(g.id)).map(g => (
                       <TouchableOpacity
                         key={g.id}
                         style={[styles.optionCard, { backgroundColor: colors.bg, borderColor: colors.border },
@@ -615,6 +1177,37 @@ Respond with ONLY a valid JSON object, no markdown fences, no extra text:
                     <TouchableOpacity style={[styles.wizardBtn, styles.wizardBtnBack, { borderColor: colors.border }]} onPress={() => setStep(1)} activeOpacity={0.7}>
                       <Text style={[styles.wizardBtnText, { color: colors.text2 }]}>← Back</Text>
                     </TouchableOpacity>
+                    <TouchableOpacity style={[styles.wizardBtn, { backgroundColor: colors.accent, flex: 1 }]} onPress={() => setStep(3)} activeOpacity={0.85}>
+                      <Text style={styles.wizardBtnText}>Next →</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
+              )}
+
+              {step === 3 && (
+                <>
+                  <Text style={[styles.wizardTitle, { color: colors.text }]}>Where are you starting from?</Text>
+                  <Text style={[styles.wizardSub, { color: colors.text2 }]}>
+                    Optional — tell us your current numbers so the plan starts at the right level. Leave blank to use your fitness level.
+                  </Text>
+                  <TextInput
+                    style={[styles.capabilityInput, { backgroundColor: colors.bg, borderColor: colors.border, color: colors.text }]}
+                    placeholder={capabilityPlaceholder}
+                    placeholderTextColor={colors.text3}
+                    value={currentCap}
+                    onChangeText={setCurrentCap}
+                    multiline
+                    numberOfLines={4}
+                    textAlignVertical="top"
+                    maxLength={400}
+                  />
+                  <Text style={[styles.capabilityHint, { color: colors.text3 }]}>
+                    {currentCap.length}/400 · The more specific, the better your plan progression.
+                  </Text>
+                  <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+                    <TouchableOpacity style={[styles.wizardBtn, styles.wizardBtnBack, { borderColor: colors.border }]} onPress={() => setStep(2)} activeOpacity={0.7}>
+                      <Text style={[styles.wizardBtnText, { color: colors.text2 }]}>← Back</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity style={[styles.wizardBtn, { backgroundColor: colors.accent, flex: 1 }]} onPress={generate} activeOpacity={0.85}>
                       <Text style={styles.wizardBtnText}>Generate My Plan ✨</Text>
                     </TouchableOpacity>
@@ -634,13 +1227,17 @@ Respond with ONLY a valid JSON object, no markdown fences, no extra text:
 function WorkoutDayCard({ dayData, dayDate, onPress }) {
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
+  const { planCompletions, togglePlanCompletion } = useStore();
 
   const today   = new Date(); today.setHours(0, 0, 0, 0);
   const isToday = dayDate?.toDateString() === today.toDateString();
-  const isPast  = dayDate < today && !isToday;
   const isRest  = dayData.type === 'rest';
 
-  const stripeCol = isPast && !isRest ? colors.green
+  // User-controlled completion state — date string keyed by local YYYY-MM-DD.
+  const dateKey = dayDate ? formatDateKey(dayDate) : null;
+  const isCompleted = !!(dateKey && planCompletions?.[dateKey]);
+
+  const stripeCol = isCompleted && !isRest ? colors.green
                   : dayData.type === 'cardio' ? colors.green
                   : dayData.type === 'rest'   ? colors.border
                   : colors.accent;
@@ -655,29 +1252,38 @@ function WorkoutDayCard({ dayData, dayDate, onPress }) {
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.82}
-      style={{ marginBottom: 10, borderRadius: 16, opacity: isPast && isRest ? 0.5 : 1 }}
+      style={{ marginBottom: 10, borderRadius: 16 }}
     >
       <View style={[
         styles.wdCard,
         { backgroundColor: colors.surface, borderColor: borderCol },
-        isToday && { borderWidth: 2 },
+        // borderWidth is always 2 so the layout doesn't shift when 'Today'
+        // gets its accent border — previously the 1px → 2px swap made the
+        // active card 1px taller/wider than its neighbours.
       ]}>
         {/* Colored left stripe */}
         <View style={[styles.wdStripe, { backgroundColor: stripeCol }]} />
 
         <View style={styles.wdBody}>
-          {/* Top row: date + checkbox */}
+          {/* Top row: date + tappable checkbox */}
           <View style={styles.wdTopRow}>
             <Text style={[styles.wdDate, { color: isToday ? colors.accent : colors.text3 }]}>
               {dateLabel}{!isRest ? ` · ~${estMins}m` : ''}
             </Text>
-            <View style={[
-              styles.wdCheck,
-              { borderColor: isPast && !isRest ? colors.green : colors.border },
-              isPast && !isRest && { backgroundColor: colors.green },
-            ]}>
-              {isPast && !isRest && <Text style={{ color: '#fff', fontSize: 11, fontWeight: '900' }}>✓</Text>}
-            </View>
+            {!isRest && (
+              <TouchableOpacity
+                onPress={(e) => { e.stopPropagation(); dateKey && togglePlanCompletion(dateKey); }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                activeOpacity={0.7}
+                style={[
+                  styles.wdCheck,
+                  { borderColor: isCompleted ? colors.green : colors.border },
+                  isCompleted && { backgroundColor: colors.green },
+                ]}
+              >
+                {isCompleted && <Text style={{ color: '#fff', fontSize: 11, fontWeight: '900' }}>✓</Text>}
+              </TouchableOpacity>
+            )}
           </View>
 
           {/* Title */}
@@ -686,23 +1292,33 @@ function WorkoutDayCard({ dayData, dayDate, onPress }) {
           </Text>
 
           {/* Bottom row */}
-          {!isRest && (
-            <View style={styles.wdBottomRow}>
-              <Text style={[styles.wdType, { color: colors.text3 }]}>
-                {dayData.type === 'cardio' ? '🏃 Cardio' : '💪 Strength'}
-              </Text>
-              {dayData.exercises?.length > 0 && (
-                <Text style={[styles.wdExCount, { color: colors.text3 }]}>
-                  {' '}· {dayData.exercises.length} exercises
+          {!isRest && (() => {
+            const meta = dayTypeMeta(dayData, colors);
+            const exCount = dayData.exercises?.length || 0;
+            const exLabel = meta?.isCircuit ? 'movements' : 'exercises';
+            return (
+              <View style={styles.wdBottomRow}>
+                <Text style={[styles.wdType, { color: meta?.accent || colors.text3 }]}>
+                  {meta?.emoji} {meta?.label}
                 </Text>
-              )}
-              {isToday && (
-                <View style={[styles.todayPill, { backgroundColor: colors.accent, marginLeft: 8 }]}>
-                  <Text style={styles.todayPillText}>Today</Text>
-                </View>
-              )}
-            </View>
-          )}
+                {!!dayData.format && (
+                  <Text style={[styles.wdExCount, { color: colors.text3 }]}>
+                    {' '}· {dayData.format}
+                  </Text>
+                )}
+                {exCount > 0 && !dayData.format && (
+                  <Text style={[styles.wdExCount, { color: colors.text3 }]}>
+                    {' '}· {exCount} {exLabel}
+                  </Text>
+                )}
+                {isToday && (
+                  <View style={[styles.todayPill, { backgroundColor: colors.accent, marginLeft: 8 }]}>
+                    <Text style={styles.todayPillText}>Today</Text>
+                  </View>
+                )}
+              </View>
+            );
+          })()}
 
           {/* Tap hint arrow */}
           <Text style={[styles.wdArrow, { color: colors.text3 }]}>›</Text>
@@ -773,6 +1389,31 @@ function CoachScheduleCard({ scheduledWorkouts, onOpenWorkout }) {
 
 // ── Week Card ─────────────────────────────────────────────────────────────────
 
+// Color palette mapped to common phase names (matches LLM output naming).
+// Defaults to a neutral gray for unrecognized phase names.
+const PHASE_COLORS = {
+  foundation:  '#3b82f6',
+  base:        '#3b82f6',
+  build:       '#f59e0b',
+  threshold:   '#f59e0b',
+  tempo:       '#f59e0b',
+  speed:       '#f59e0b',
+  peak:        '#ef4444',
+  race:        '#ef4444',
+  taper:       '#22c55e',
+  deload:      '#22c55e',
+  recovery:    '#22c55e',
+  specialization: '#a855f7',
+};
+function colorForPhaseName(name) {
+  if (!name) return '#64748b';
+  const k = name.toLowerCase().split(/\s|&|\//)[0];
+  return PHASE_COLORS[k] || '#64748b';
+}
+
+// LEGACY fallback: if a plan was generated before v1.1.0 (no `phases`), compute
+// a coarse phase label from the % position in the program. Replaced by the
+// LLM-provided phases when available.
 function getPhase(weekNum, totalWeeks) {
   const pct = weekNum / totalWeeks;
   if (pct <= 0.33) return { label: 'Foundation', color: '#3b82f6', tip: 'Build your base — master form before adding load' };
@@ -780,7 +1421,8 @@ function getPhase(weekNum, totalWeeks) {
   return               { label: 'Peak',        color: '#ef4444', tip: 'Maximum effort — sets and reps at their highest point' };
 }
 
-// Apply progressive overload per phase: Foundation = base, Build = +1 set, Peak = +2 sets & heavier reps
+// LEGACY fallback: mechanical progression for old plans without LLM-provided
+// per-week progression notes. Replaced by phase rotation in v1.1.0+.
 function applyProgression(exercises, phase) {
   if (!exercises?.length || phase.label === 'Foundation') return exercises;
   return exercises.map(ex => {
@@ -790,35 +1432,108 @@ function applyProgression(exercises, phase) {
       : Math.min(baseSets + 2, 6); // Peak
     let reps = ex.reps || '10';
     if (phase.label === 'Peak' && typeof reps === 'string') {
-      // Bump every number in a rep range, e.g. "8-12" → "10-14", "10" → "12"
       reps = reps.replace(/\d+/g, n => String(Math.min(parseInt(n) + 2, 30)));
     }
     return { ...ex, sets, reps };
   });
 }
 
-function WeekCard({ weekNum, plan, currentWeekNum, onOpenWorkout }) {
+// ── v1.1.0 phase helpers ─────────────────────────────────────────────────────
+// Plans generated v1.1.0+ include a `phases` array with per-phase schedules and
+// per-week progression notes. These helpers expose that data; they fall back to
+// legacy fields for plans created before v1.1.0.
+
+// Find the phase that contains a given week. Returns null if no phases array
+// (caller can fall back to legacy `getPhase`).
+function getPhaseForWeek(plan, weekNum) {
+  if (!plan?.phases?.length) return null;
+  return (
+    plan.phases.find(p => weekNum >= (p.startWeek || 1) && weekNum <= (p.endWeek || 1))
+    || plan.phases[plan.phases.length - 1]   // beyond last phase: clamp to last
+  );
+}
+
+// Schedule (Mon-Sun) for the given week — rotates through scheduleVariants if
+// the phase provides them (week 1 = variant 0, week 2 = variant 1, week 3 = variant 0, ...),
+// falls back to phase.schedule (single-variant pre-fix), then plan.weeklySchedule.
+function getScheduleForWeek(plan, weekNum) {
+  const phase = getPhaseForWeek(plan, weekNum);
+  if (phase?.scheduleVariants?.length) {
+    const idxInPhase = weekNum - (phase.startWeek || 1);
+    const variantIdx = ((idxInPhase % phase.scheduleVariants.length) + phase.scheduleVariants.length) % phase.scheduleVariants.length;
+    const variant = phase.scheduleVariants[variantIdx];
+    if (Array.isArray(variant?.schedule) && variant.schedule.length > 0) return variant.schedule;
+  }
+  if (Array.isArray(phase?.schedule) && phase.schedule.length > 0) return phase.schedule;
+  return Array.isArray(plan?.weeklySchedule) ? plan.weeklySchedule : [];
+}
+
+// Per-week progression note from the LLM. Returns null if no note for this week
+// (legacy plans, or weeks outside any phase).
+function getProgressionNoteForWeek(plan, weekNum) {
+  const phase = getPhaseForWeek(plan, weekNum);
+  if (!phase || !Array.isArray(phase.weekProgressions)) return null;
+  const idxInPhase = weekNum - (phase.startWeek || 1);
+  return phase.weekProgressions[idxInPhase] || null;
+}
+
+// Per-week progression tags (small badge strings like "+1 rep", "Tempo added").
+// Returns [] if the LLM didn't provide them or this is a legacy plan.
+function getProgressionTagsForWeek(plan, weekNum) {
+  const phase = getPhaseForWeek(plan, weekNum);
+  if (!phase || !Array.isArray(phase.progressionTagsByWeek)) return [];
+  const idxInPhase = weekNum - (phase.startWeek || 1);
+  const tags = phase.progressionTagsByWeek[idxInPhase];
+  return Array.isArray(tags) ? tags.filter(t => typeof t === 'string' && t.trim()) : [];
+}
+
+function WeekCard({ weekNum, plan, currentWeekNum, onOpenWorkout, onReorder, onDragActive }) {
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const isCompleted = weekNum < currentWeekNum;
   const isCurrent   = weekNum === currentWeekNum;
   const [expanded, setExpanded] = useState(isCurrent);
-  const phase = getPhase(weekNum, plan.durationWeeks || 12);
+  const { planCompletions } = useStore();
 
+  // v1.1.0+ plans: use LLM-provided phase data. Legacy plans fall back to getPhase().
+  const llmPhase = getPhaseForWeek(plan, weekNum);
+  const phase = llmPhase
+    ? { label: llmPhase.name || 'Phase', color: colorForPhaseName(llmPhase.name), focus: llmPhase.focus }
+    : getPhase(weekNum, plan.durationWeeks || 12);
+  const progressionNote = getProgressionNoteForWeek(plan, weekNum);
+  const progressionTags = getProgressionTagsForWeek(plan, weekNum);
+
+  // Plan weeks start on the day the user generated the plan (not the previous
+  // Monday). Week 1 = generation day, Week 2 = +7 days, etc. The schedule's
+  // "Monday/Tuesday/..." labels are just sequence markers — the actual day-of-week
+  // shown to the user comes from dayDate.
   const planStart = new Date(plan.startDate);
-  const weekStart = getMondayOfWeek(addDays(planStart, (weekNum - 1) * 7));
+  planStart.setHours(0, 0, 0, 0);
+  const weekStart = addDays(planStart, (weekNum - 1) * 7);
+  weekStart.setHours(0, 0, 0, 0);
   const weekEnd   = addDays(weekStart, 6);
   const today     = new Date(); today.setHours(0, 0, 0, 0);
 
-  const daysPassed    = isCurrent
-    ? Math.min(Math.max(Math.floor((today - weekStart) / 86400000) + 1, 0), 7)
-    : isCompleted ? 7 : 0;
-  const weekProgress  = daysPassed / 7;
-
-  const schedule      = plan.weeklySchedule || [];
+  // v1.1.0: pull phase-specific schedule when phases are present (so each phase
+  // has different exercises). Falls back to plan.weeklySchedule for legacy plans.
+  const schedule      = getScheduleForWeek(plan, weekNum);
   const workoutDays   = schedule.filter(d => d.type !== 'rest');
   const estimatedMins = workoutDays.reduce((s, d) => s + (d.exercises?.length || 0) * 8, 0) || workoutDays.length * 30;
+
+  // Map each workout day to its actual calendar date key for completion lookup.
+  const workoutDateKeys = schedule
+    .map((d, i) => ({ d, dateKey: formatDateKey(addDays(weekStart, i)) }))
+    .filter(({ d }) => d.type !== 'rest')
+    .map(({ dateKey }) => dateKey);
+
+  // Week-level "completed" flag is now derived from user-marked day completions
+  // (not from calendar date). A week is complete when every workout day in it
+  // has been ticked off by the user.
+  const completedCount = workoutDateKeys.filter(k => planCompletions?.[k]).length;
+  const weekProgress   = workoutDateKeys.length > 0
+    ? completedCount / workoutDateKeys.length
+    : 0;
+  const isCompleted = workoutDateKeys.length > 0 && completedCount === workoutDateKeys.length;
 
   return (
     <View style={[
@@ -873,25 +1588,175 @@ function WeekCard({ weekNum, plan, currentWeekNum, onOpenWorkout }) {
         </View>
       </View>
 
-      {/* Expanded: workout day cards */}
+      {/* Expanded: progression note (if LLM provided one for this week) + draggable day cards */}
       {expanded && (
-        <View style={{ marginTop: 14 }}>
-          {DAY_ORDER.map((dayName, i) => {
-            const dayData = schedule.find(d => d.day === dayName)
-              || { day: dayName, type: 'rest', focus: 'Rest & Recovery', exercises: [] };
-            const dayDate = addDays(weekStart, i);
-            dayDate.setHours(0, 0, 0, 0);
-            return (
-              <WorkoutDayCard
-                key={dayName}
-                dayData={dayData}
-                dayDate={dayDate}
-                onPress={() => onOpenWorkout(dayData, dayDate, weekNum)}
-              />
-            );
-          })}
-        </View>
+        <>
+          {!!progressionNote && (
+            <View style={[styles.progressionNote, { backgroundColor: phase.color + '14', borderColor: phase.color + '44' }]}>
+              <Text style={[styles.progressionNoteLabel, { color: phase.color }]}>This Week</Text>
+              <Text style={[styles.progressionNoteText, { color: colors.text }]}>{progressionNote}</Text>
+              {progressionTags.length > 0 && (
+                <View style={styles.progressionTagRow}>
+                  {progressionTags.map((tag, i) => (
+                    <View key={i} style={[styles.progressionTag, { backgroundColor: phase.color + '22', borderColor: phase.color + '66' }]}>
+                      <Text style={[styles.progressionTagText, { color: phase.color }]}>{tag}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          )}
+          <DraggableWorkoutDayList
+            key={(schedule || []).map(d => d.day + d.type + d.focus).join('|')}
+            schedule={schedule}
+            weekStart={weekStart}
+            weekNum={weekNum}
+            colors={colors}
+            onReorder={onReorder}
+            onDragActive={onDragActive}
+            onOpenWorkout={onOpenWorkout}
+          />
+        </>
       )}
+    </View>
+  );
+}
+
+// ── Drag-to-Reorder Workout Day List (used inside each expanded WeekCard) ────
+// Shows the rich WorkoutDayCard with a ≡ handle on the right — hold and drag to
+// reorder the week's day types. Because weeklySchedule is one shared template,
+// reordering here propagates across all weeks.
+
+function DraggableWorkoutDayList({ schedule, weekStart, weekNum, colors, onReorder, onDragActive, onOpenWorkout }) {
+  const styles      = useMemo(() => makeStyles(colors), [colors]);
+  const ITEM_H      = 108; // WorkoutDayCard height + marginBottom
+  const HOLD_MS     = 500; // how long the user must press-and-hold before drag arms
+  const MOVE_CANCEL = 8;   // px of finger movement during hold that cancels the long-press
+  const n           = schedule.length;
+
+  const [order, setOrder]          = useState(() => schedule.map((_, i) => i));
+  const [activeOrigIdx, setActive] = useState(-1);
+
+  const orderRef        = useRef(order);
+  const dragAnim        = useRef(new Animated.Value(0)).current;
+  const dragStartPosRef = useRef(-1);
+  const dragCurrPosRef  = useRef(-1);
+  // One timer ref per row — tracks the "press-and-hold" countdown before drag arms
+  const holdTimersRef   = useRef(schedule.map(() => null));
+  const armedRef        = useRef(schedule.map(() => false));
+
+  useEffect(() => {
+    setOrder(schedule.map((_, i) => i));
+    orderRef.current = schedule.map((_, i) => i);
+  }, [schedule.map(d => d.day + d.type + d.focus).join('|')]);
+
+  const panResponders = useRef(
+    schedule.map((_, origIdx) =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder:  () => true,
+        onPanResponderGrant: () => {
+          // Start the hold timer — only arm drag after the user holds long enough
+          armedRef.current[origIdx] = false;
+          if (holdTimersRef.current[origIdx]) clearTimeout(holdTimersRef.current[origIdx]);
+          holdTimersRef.current[origIdx] = setTimeout(() => {
+            armedRef.current[origIdx] = true;
+            holdTimersRef.current[origIdx] = null;
+            const startPos = orderRef.current.indexOf(origIdx);
+            dragStartPosRef.current = startPos;
+            dragCurrPosRef.current  = startPos;
+            dragAnim.setValue(0);
+            setActive(origIdx);
+            onDragActive?.(true);
+          }, HOLD_MS);
+        },
+        onPanResponderMove: (_, gs) => {
+          // Before hold completes: any meaningful movement cancels the long-press
+          if (!armedRef.current[origIdx]) {
+            if (Math.abs(gs.dx) > MOVE_CANCEL || Math.abs(gs.dy) > MOVE_CANCEL) {
+              if (holdTimersRef.current[origIdx]) {
+                clearTimeout(holdTimersRef.current[origIdx]);
+                holdTimersRef.current[origIdx] = null;
+              }
+            }
+            return;
+          }
+          // Drag is armed — handle reorder
+          const fingerY    = dragStartPosRef.current * ITEM_H + gs.dy;
+          const targetSlot = Math.max(0, Math.min(n - 1, Math.round(fingerY / ITEM_H)));
+          if (targetSlot !== dragCurrPosRef.current) {
+            const newOrder = [...orderRef.current];
+            const [item]   = newOrder.splice(dragCurrPosRef.current, 1);
+            newOrder.splice(targetSlot, 0, item);
+            orderRef.current       = newOrder;
+            dragCurrPosRef.current = targetSlot;
+            setOrder([...newOrder]);
+          }
+          dragAnim.setValue(fingerY - dragCurrPosRef.current * ITEM_H);
+        },
+        onPanResponderRelease: () => {
+          // Released before hold completed — cancel silently, no reorder
+          if (holdTimersRef.current[origIdx]) {
+            clearTimeout(holdTimersRef.current[origIdx]);
+            holdTimersRef.current[origIdx] = null;
+            return;
+          }
+          if (!armedRef.current[origIdx]) return;
+          armedRef.current[origIdx] = false;
+          setActive(-1);
+          dragAnim.setValue(0);
+          onDragActive?.(false);
+          onReorder?.([...orderRef.current]);
+        },
+        onPanResponderTerminate: () => {
+          if (holdTimersRef.current[origIdx]) {
+            clearTimeout(holdTimersRef.current[origIdx]);
+            holdTimersRef.current[origIdx] = null;
+          }
+          armedRef.current[origIdx] = false;
+          setActive(-1);
+          dragAnim.setValue(0);
+          onDragActive?.(false);
+        },
+      })
+    )
+  ).current;
+
+  return (
+    <View style={{ height: n * ITEM_H, marginTop: 14 }}>
+      {order.map((origIdx, posIdx) => {
+        const dayData = schedule[origIdx] || { day: DAY_ORDER[posIdx], type: 'rest', focus: 'Rest & Recovery', exercises: [] };
+        const dayDate = addDays(weekStart, posIdx);
+        dayDate.setHours(0, 0, 0, 0);
+        const isActive = origIdx === activeOrigIdx;
+
+        return (
+          <Animated.View
+            key={origIdx}
+            style={{
+              position: 'absolute',
+              top: posIdx * ITEM_H,
+              left: 0, right: 0,
+              zIndex:    isActive ? 10 : 1,
+              elevation: isActive ? 8  : 1,
+              transform: isActive ? [{ translateY: dragAnim }] : [],
+            }}
+          >
+            <WorkoutDayCard
+              dayData={dayData}
+              dayDate={dayDate}
+              onPress={() => onOpenWorkout(dayData, dayDate, weekNum)}
+            />
+            {/* Drag handle overlay — pinned to the right edge of the card */}
+            <View
+              {...panResponders[origIdx].panHandlers}
+              style={styles.wdDragHandle}
+            >
+              <Text style={[styles.wdDragIcon, { color: colors.text3 }]}>≡</Text>
+            </View>
+          </Animated.View>
+        );
+      })}
     </View>
   );
 }
@@ -965,9 +1830,8 @@ function DraggableDayList({ schedule, colors, onReorder, onDragActive }) {
         const day      = schedule[origIdx];
         const isRest   = day.type === 'rest';
         const isActive = origIdx === activeOrigIdx;
-        const stripe   = day.type === 'cardio' ? colors.green
-                       : isRest               ? colors.border
-                       :                        colors.accent;
+        const meta     = dayTypeMeta(day, colors);
+        const stripe   = isRest ? colors.border : (meta?.accent || colors.accent);
         return (
           <Animated.View
             key={origIdx}
@@ -1038,7 +1902,31 @@ export default function PlanScreen() {
       ...workoutPlan.weeklySchedule[origIdx],
       day: DAY_ORDER[posIdx],
     }));
-    setWorkoutPlan({ ...workoutPlan, weeklySchedule: newSchedule });
+    const commit = () => setWorkoutPlan({ ...workoutPlan, weeklySchedule: newSchedule });
+
+    // Coaching guard: warn on suboptimal sequencing (running on fatigued legs,
+    // or heavy legs the day after a long run). User can override either way.
+    const conflict = findOrderingConflict(newSchedule);
+    if (conflict) {
+      const cur  = newSchedule[conflict.idx];
+      const next = newSchedule[(conflict.idx + 1) % newSchedule.length];
+      const title = conflict.kind === 'leg-then-run'
+        ? 'Heads up — run day after leg day'
+        : 'Heads up — leg day after run day';
+      const message = conflict.kind === 'leg-then-run'
+        ? `You've placed "${next.focus || 'a run'}" the day after "${cur.focus || 'a leg session'}". Running on fatigued legs increases injury risk and dulls both sessions. We recommend at least one rest or upper-body day between them.`
+        : `You've placed "${next.focus || 'a leg session'}" the day after "${cur.focus || 'a run'}". Heavy lower-body work on tired legs from running can compromise both sessions. A rest or upper-body day between them is usually better.`;
+      Alert.alert(
+        title,
+        message,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Move anyway', style: 'destructive', onPress: commit },
+        ],
+      );
+      return;
+    }
+    commit();
   };
 
   // Intercept the phone's hardware/gesture back button so it closes the detail
@@ -1081,13 +1969,37 @@ export default function PlanScreen() {
 
   // ── Full-screen detail view (replaces the plan list entirely) ──
   if (detailWorkout) {
+    // For v1.1.0+ plans the LLM has already shaped exercises per phase, so we
+    // suppress the legacy mechanical progression. Also pass the per-week note.
+    const hasLlmPhases = Array.isArray(workoutPlan?.phases) && workoutPlan.phases.length > 0;
     return (
       <WorkoutDetailScreen
         workout={detailWorkout.dayData}
         dayDate={detailWorkout.dayDate}
         weekNum={detailWorkout.weekNum}
         totalWeeks={totalWeeks}
-        onStart={() => { closeDetail(); navigation.navigate('Workout'); }}
+        useLlmProgression={hasLlmPhases}
+        progressionNote={hasLlmPhases ? getProgressionNoteForWeek(workoutPlan, detailWorkout.weekNum) : null}
+        onStart={(routine) => {
+          closeDetail();
+          // Routing by day type:
+          //   crossfit / hyrox / mobility → dedicated CircuitTimer screen
+          //     (AMRAP / EMOM / Rounds-For-Time countdowns + round counter)
+          //   run / cardio                → Workout tab, GPS run flow autostarts
+          //                                  (startRun param → gps-setup → countdown)
+          //   strength (everything else)  → Workout tab, full routine ships in
+          //                                  startRoutine param so it autostarts
+          const circuitTypes = ['crossfit', 'hyrox', 'mobility'];
+          if (circuitTypes.includes(routine.dayType)) {
+            navigation.navigate('CircuitTimer', { routine });
+          } else if (routine.type === 'cardio') {
+            // Pass a fresh timestamp so the param reference always changes —
+            // re-tapping Start Workout re-triggers the autostart effect.
+            navigation.navigate('Workout', { startRun: 'run', startRunAt: Date.now() });
+          } else {
+            navigation.navigate('Workout', { startRoutine: routine });
+          }
+        }}
       />
     );
   }
@@ -1196,11 +2108,23 @@ export default function PlanScreen() {
             <View style={[styles.planCard, { backgroundColor: colors.accent }]}>
               <View style={styles.planCardBg} />
               <View style={styles.planCardBg2} />
+
+              {/* Delete button — top right corner so users can see which plan they're deleting */}
+              <TouchableOpacity
+                style={styles.planDeleteBtn}
+                onPress={confirmDeletePlan}
+                activeOpacity={0.7}
+                accessibilityLabel="Delete this plan"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={styles.planDeleteBtnIcon}>🗑</Text>
+              </TouchableOpacity>
+
               <View style={styles.planTopRow}>
                 <View style={[styles.planGoalBadge, { backgroundColor: 'rgba(255,255,255,0.25)' }]}>
                   <Text style={styles.planGoalText}>{workoutPlan.goal}</Text>
                 </View>
-                <Text style={styles.planWeekLabel}>Week {currentWeekNum} / {totalWeeks}</Text>
+                <Text style={[styles.planWeekLabel, { marginRight: 40 }]}>Week {currentWeekNum} / {totalWeeks}</Text>
               </View>
               <Text style={styles.planName}>{workoutPlan.planName}</Text>
               <Text style={styles.planDaysLabel}>{workoutPlan.daysPerWeek} days / week</Text>
@@ -1227,19 +2151,6 @@ export default function PlanScreen() {
               </View>
             </View>
 
-            {/* ── Weekly Schedule (drag ≡ to reorder) ── */}
-            <View style={{ marginBottom: 4 }}>
-              <Text style={[styles.sectionTitle, { color: colors.text }]}>Weekly Schedule</Text>
-              <Text style={[styles.reorderHint, { color: colors.text3 }]}>Hold ≡ and drag to reorder days</Text>
-            </View>
-            <DraggableDayList
-              key={(workoutPlan.weeklySchedule || []).map(d => d.day + d.type).join('|')}
-              schedule={workoutPlan.weeklySchedule || []}
-              colors={colors}
-              onReorder={handleReorder}
-              onDragActive={active => setScrollEnabled(!active)}
-            />
-
             {/* Coach schedule section */}
             {hasCoachSchedule && (
               <>
@@ -1253,6 +2164,7 @@ export default function PlanScreen() {
 
             {/* Week-by-week */}
             <Text style={[styles.sectionTitle, { color: colors.text }]}>All Weeks</Text>
+            <Text style={[styles.reorderHint, { color: colors.text3 }]}>Press and hold ≡ on a day, then drag to reorder</Text>
             {Array.from({ length: totalWeeks }, (_, i) => (
               <WeekCard
                 key={i + 1}
@@ -1260,6 +2172,8 @@ export default function PlanScreen() {
                 plan={workoutPlan}
                 currentWeekNum={currentWeekNum}
                 onOpenWorkout={openWorkout}
+                onReorder={handleReorder}
+                onDragActive={active => setScrollEnabled(!active)}
               />
             ))}
 
@@ -1288,10 +2202,6 @@ export default function PlanScreen() {
             <TouchableOpacity style={[styles.newPlanBtn, { borderColor: colors.border }]} onPress={confirmNewPlan} activeOpacity={0.7}>
               <Text style={[styles.newPlanBtnText, { color: colors.text2 }]}>✦ Create a New Plan</Text>
             </TouchableOpacity>
-
-            <TouchableOpacity style={[styles.deletePlanBtn, { borderColor: '#FF3B3022' }]} onPress={confirmDeletePlan} activeOpacity={0.7}>
-              <Text style={styles.deletePlanBtnText}>🗑  Delete This Plan</Text>
-            </TouchableOpacity>
           </>
         )}
 
@@ -1316,6 +2226,9 @@ const makeStyles = (colors) => StyleSheet.create({
   headerRight:    { flexDirection: 'row', alignItems: 'center', gap: 8 },
   newPlanHeaderBtn:     { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6 },
   newPlanHeaderBtnText: { fontSize: 12, fontWeight: '700' },
+  // Delete button pinned to the top-right of the plan header card
+  planDeleteBtn:        { position: 'absolute', top: 10, right: 10, zIndex: 5, width: 34, height: 34, borderRadius: 17, backgroundColor: 'rgba(255,255,255,0.22)', alignItems: 'center', justifyContent: 'center' },
+  planDeleteBtnIcon:    { fontSize: 15 },
   pageTitle:      { fontSize: 34, fontWeight: '900', color: colors.text },
   pageSub:        { fontSize: 13, color: colors.text2, marginTop: 2, maxWidth: 220 },
   sectionTitle:   { fontSize: 14, fontWeight: '800', color: colors.text, marginTop: 4, marginBottom: 10, textTransform: 'uppercase', letterSpacing: 0.5 },
@@ -1335,6 +2248,12 @@ const makeStyles = (colors) => StyleSheet.create({
   // ── Phase badge ──
   phaseBadge:     { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
   phaseBadgeText: { fontSize: 11, fontWeight: '700' },
+  progressionNote:     { borderRadius: 12, padding: 12, marginTop: 12, marginBottom: 4, borderWidth: 1 },
+  progressionNoteLabel:{ fontSize: 11, fontWeight: '800', letterSpacing: 0.6, textTransform: 'uppercase', marginBottom: 4 },
+  progressionNoteText: { fontSize: 14, lineHeight: 20, fontWeight: '500' },
+  progressionTagRow:   { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 },
+  progressionTag:      { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1 },
+  progressionTagText:  { fontSize: 11, fontWeight: '700', letterSpacing: 0.3 },
   phaseBox:       { flexDirection: 'row', alignItems: 'flex-start', gap: 10, borderRadius: 14, borderWidth: 1, padding: 12, marginBottom: 14 },
   phaseDot:       { width: 8, height: 8, borderRadius: 4, marginTop: 4 },
   phaseBoxLabel:  { fontSize: 13, fontWeight: '800', marginBottom: 2 },
@@ -1342,6 +2261,9 @@ const makeStyles = (colors) => StyleSheet.create({
 
   // ── Drag-to-reorder list ──
   reorderHint:    { fontSize: 12, marginBottom: 10, marginTop: -6 },
+  // Drag handle inside expanded week — sits on the right edge of each WorkoutDayCard
+  wdDragHandle:   { position: 'absolute', right: 2, top: 0, bottom: 10, width: 40, alignItems: 'center', justifyContent: 'center' },
+  wdDragIcon:     { fontSize: 22, fontWeight: '800' },
   dlRow:          { flexDirection: 'row', alignItems: 'center', borderRadius: 12, borderWidth: 1, overflow: 'hidden', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowRadius: 4 },
   dlStripe:       { width: 4, alignSelf: 'stretch' },
   dlDayName:      { fontSize: 10, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 },
@@ -1431,12 +2353,17 @@ const makeStyles = (colors) => StyleSheet.create({
   wizardBtn:        { borderRadius: 16, paddingVertical: 16, alignItems: 'center' },
   wizardBtnBack:    { flex: 0.45, backgroundColor: 'transparent', borderWidth: 1 },
   wizardBtnText:    { color: '#fff', fontSize: 16, fontWeight: '700' },
+  capabilityInput:  { borderRadius: 16, padding: 16, borderWidth: 1, fontSize: 15, lineHeight: 22, minHeight: 120, marginBottom: 6 },
+  capabilityHint:   { fontSize: 12, marginTop: 2 },
   loadingState:     { alignItems: 'center', paddingVertical: 48 },
   loadingTitle:     { fontSize: 20, fontWeight: '800', marginTop: 20, marginBottom: 10 },
   loadingSub:       { fontSize: 14, textAlign: 'center', lineHeight: 22, paddingHorizontal: 20 },
 
   // ── Workout day card ──
-  wdCard:           { borderRadius: 16, borderWidth: 1, flexDirection: 'row', ...shadow.card },
+  // minHeight keeps every card the same size so the absolutely-positioned
+  // DraggableWorkoutDayList (fixed 108px slots) has no gap after the shorter
+  // rest-day cards. 98 + 10px marginBottom = the list's ITEM_H of 108.
+  wdCard:           { borderRadius: 16, borderWidth: 2, flexDirection: 'row', minHeight: 98, ...shadow.card },
   wdStripe:         { width: 6, borderTopLeftRadius: 16, borderBottomLeftRadius: 16 },
   wdBody:           { flex: 1, padding: 14 },
   wdTopRow:         { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },

@@ -9,6 +9,10 @@ import { supabase } from '../lib/supabase';
 import { signInWithProvider } from '../lib/socialAuth';
 import useColors from '../lib/useColors';
 
+// Social login is disabled for v1.0.0. Re-enable once each provider
+// (Google/Apple/Facebook/X) is properly configured in the Supabase dashboard.
+const SOCIAL_LOGIN_ENABLED = false;
+
 const SOCIAL = [
   { id: 'google',   label: 'Continue with Google',   bg: '#fff',     textColor: '#333', borderColor: '#e8e8e8' },
   { id: 'apple',    label: 'Continue with Apple',    bg: '#000',     textColor: '#fff', borderColor: '#000'   },
@@ -40,6 +44,7 @@ export default function LoginScreen({ onBack, onSwitch }) {
   const [socialLoading, setSocialLoading] = useState(null);
   const [err, setErr]             = useState('');
   const [resetSent, setResetSent] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   const login = async () => {
     if (!email || !password) { setErr('Please fill in all fields.'); return; }
@@ -83,27 +88,31 @@ export default function LoginScreen({ onBack, onSwitch }) {
           <Text style={styles.title}>Welcome{'\n'}Back</Text>
           <Text style={styles.subtitle}>Sign in to continue your journey</Text>
 
-          {SOCIAL.map(s => (
-            <TouchableOpacity
-              key={s.id}
-              style={[styles.socialBtn, { backgroundColor: s.bg, borderColor: s.borderColor }]}
-              onPress={() => handleSocial(s.id)}
-              disabled={!!socialLoading}
-              activeOpacity={0.85}
-            >
-              {socialLoading === s.id
-                ? <ActivityIndicator color={s.textColor} style={{ marginRight: 12 }} />
-                : <SocialIcon id={s.id} styles={styles} />
-              }
-              <Text style={[styles.socialBtnText, { color: s.textColor }]}>{s.label}</Text>
-            </TouchableOpacity>
-          ))}
+          {SOCIAL_LOGIN_ENABLED && (
+            <>
+              {SOCIAL.map(s => (
+                <TouchableOpacity
+                  key={s.id}
+                  style={[styles.socialBtn, { backgroundColor: s.bg, borderColor: s.borderColor }]}
+                  onPress={() => handleSocial(s.id)}
+                  disabled={!!socialLoading}
+                  activeOpacity={0.85}
+                >
+                  {socialLoading === s.id
+                    ? <ActivityIndicator color={s.textColor} style={{ marginRight: 12 }} />
+                    : <SocialIcon id={s.id} styles={styles} />
+                  }
+                  <Text style={[styles.socialBtnText, { color: s.textColor }]}>{s.label}</Text>
+                </TouchableOpacity>
+              ))}
 
-          <View style={styles.divider}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>or with email</Text>
-            <View style={styles.dividerLine} />
-          </View>
+              <View style={styles.divider}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.dividerText}>or with email</Text>
+                <View style={styles.dividerLine} />
+              </View>
+            </>
+          )}
 
           <Text style={styles.label}>Email</Text>
           <TextInput
@@ -117,14 +126,26 @@ export default function LoginScreen({ onBack, onSwitch }) {
           />
 
           <Text style={styles.label}>Password</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="••••••••"
-            placeholderTextColor={colors.text3}
-            value={password}
-            onChangeText={setPassword}
-            secureTextEntry
-          />
+          <View style={styles.passwordWrap}>
+            <TextInput
+              style={[styles.input, { paddingRight: 64, marginBottom: 0 }]}
+              placeholder="••••••••"
+              placeholderTextColor={colors.text3}
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry={!showPassword}
+            />
+            <TouchableOpacity
+              style={styles.passwordToggle}
+              onPress={() => setShowPassword(s => !s)}
+              activeOpacity={0.7}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.passwordToggleText}>
+                {showPassword ? 'Hide' : 'Show'}
+              </Text>
+            </TouchableOpacity>
+          </View>
 
           {!!err      && <Text style={styles.errText}>{err}</Text>}
           {resetSent  && <Text style={styles.successText}>✓ Password reset email sent! Check your inbox.</Text>}
@@ -182,6 +203,9 @@ const makeStyles = (colors) => StyleSheet.create({
 
   label:          { fontSize: 13, fontWeight: '600', color: colors.text2, marginBottom: 8 },
   input:          { backgroundColor: colors.surface, borderRadius: 14, padding: 16, fontSize: 16, color: colors.text, marginBottom: 16, borderWidth: 1, borderColor: colors.border },
+  passwordWrap:   { position: 'relative', marginBottom: 16 },
+  passwordToggle: { position: 'absolute', right: 12, top: 0, bottom: 0, justifyContent: 'center', paddingHorizontal: 8 },
+  passwordToggleText: { fontSize: 13, fontWeight: '600', color: colors.accent },
 
   errText:        { color: colors.red, fontSize: 13, marginBottom: 10 },
   successText:    { color: colors.green, fontSize: 13, marginBottom: 10 },

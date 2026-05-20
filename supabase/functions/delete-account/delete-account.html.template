@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delete Your AthloX Account</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+  h1 { color: #FF6B00; }
+  h2 { margin-top: 32px; }
+  code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+  ul { padding-left: 22px; }
+  .note { background: #fff8ee; border-left: 4px solid #FF6B00; padding: 12px 16px; margin: 20px 0; }
+  .primary { background: #fff8ee; border-left: 4px solid #FF6B00; padding: 16px 20px; margin: 24px 0; border-radius: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Delete Your AthloX Account</h1>
+<p><strong>Developer:</strong> Steven Mercado &middot; <strong>App:</strong> AthloX</p>
+
+<p>You can delete your AthloX account and all associated data at any time, directly from inside the app or by emailing us.</p>
+
+<div class="primary">
+  <h2 style="margin-top: 0;">In-app (recommended &middot; instant)</h2>
+  <ol>
+    <li>Open the AthloX app</li>
+    <li>Tap the <strong>Profile</strong> tab</li>
+    <li>Open <strong>Settings</strong> (gear icon, top right)</li>
+    <li>Scroll to the bottom and tap <strong>Delete my account</strong></li>
+    <li>Type <code>DELETE</code> to confirm</li>
+    <li>Your account, posts, photos and progress are removed immediately</li>
+  </ol>
+</div>
+
+<h2>By email (alternative)</h2>
+<ol>
+  <li>Send an email to <a href="mailto:athloxadmin@gmail.com?subject=AthloX%20Account%20Deletion%20Request">athloxadmin@gmail.com</a></li>
+  <li>Use the subject line: <code>AthloX Account Deletion Request</code></li>
+  <li>Include the email address associated with your AthloX account in the message body</li>
+  <li>We will verify your identity and process the deletion within <strong>30 days</strong></li>
+  <li>You will receive a confirmation email once your account has been deleted</li>
+</ol>
+
+<h2>Data that is deleted</h2>
+<p>When your account is deleted, the following data is permanently removed from our systems:</p>
+<ul>
+  <li>Your account (email, name, user ID)</li>
+  <li>Profile information (weight, height, fitness goals, onboarding preferences)</li>
+  <li>Workout plans and workout history (sets, reps, logged exercises)</li>
+  <li>GPS run history and associated location data</li>
+  <li>Community posts, photos, likes, comments, and follow relationships</li>
+  <li>AI Coach conversation history</li>
+</ul>
+
+<h2>Data that may be retained</h2>
+<ul>
+  <li><strong>Anonymised, aggregated analytics</strong> (e.g. total workout counts) may be retained indefinitely as they cannot be linked back to your identity.</li>
+  <li><strong>Records required for legal or security purposes</strong> (e.g. abuse reports, fraud prevention logs) may be retained for up to <strong>90 days</strong> after deletion.</li>
+  <li><strong>Encrypted backups</strong> may contain a copy of your data for up to <strong>30 days</strong> before they roll over and are permanently overwritten.</li>
+</ul>
+
+<h2>Questions?</h2>
+<p>If you have any questions about account deletion or how your data is handled, please see our <a href="./index.html">Privacy Policy</a> or email <a href="mailto:athloxadmin@gmail.com">athloxadmin@gmail.com</a>.</p>
+
+<p style="color: #888; font-size: 13px; margin-top: 40px;">Last updated: April 30, 2026</p>
+
+</body>
+</html>

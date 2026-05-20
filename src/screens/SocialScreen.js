@@ -15,6 +15,8 @@ import { supabase } from '../lib/supabase';
 import {
   fetchPosts, toggleLike, fetchComments, addComment as addCommentDB,
   fetchDiscoverUsers, toggleFollow as toggleFollowDB,
+  fetchFollowingPosts,
+  REPORT_REASONS, reportPost, blockUser, unblockUser, fetchBlockedIds,
   fetchUserProfile, getInitials, timeAgo, shareWorkout,
 } from '../lib/community';
 
@@ -83,6 +85,9 @@ function UserProfile({ userId, myUserId, onBack }) {
           <Avatar name={profile.name} size={60} />
           <View style={{ flex: 1 }}>
             <Text style={styles.profileName}>{profile.name}</Text>
+            {profile.username ? (
+              <Text style={styles.profileHandle}>@{profile.username}</Text>
+            ) : null}
             {profile.level ? (
               <View style={styles.levelBadge}><Text style={styles.levelText}>{profile.level}</Text></View>
             ) : null}
@@ -134,7 +139,7 @@ function UserProfile({ userId, myUserId, onBack }) {
 
 // ── PostCard ──────────────────────────────────────────────────────────────────
 
-function PostCard({ post, myUserId, myName, onLike, onViewUser, onFollow, followingIds }) {
+function PostCard({ post, myUserId, myName, onLike, onViewUser, onFollow, followingIds, onReport, onBlock }) {
   const colors  = useColors();
   const styles  = useMemo(() => makeStyles(colors), [colors]);
   const inputRef = useRef(null);
@@ -188,11 +193,35 @@ function PostCard({ post, myUserId, myName, onLike, onViewUser, onFollow, follow
           <TouchableOpacity onPress={() => onViewUser(post.userId)}>
             <Text style={styles.posterName}>{post.profile?.name || 'AthloX User'}</Text>
           </TouchableOpacity>
-          <Text style={styles.posterMeta}>{post.time}</Text>
+          <Text style={styles.posterMeta}>
+            {post.profile?.username ? `@${post.profile.username} · ` : ''}{post.time}
+          </Text>
         </View>
         {!isMine && !isFollowing && (
           <TouchableOpacity style={styles.smallFollowBtn} onPress={() => onFollow(post.userId)} activeOpacity={0.85}>
             <Text style={styles.smallFollowText}>+ Follow</Text>
+          </TouchableOpacity>
+        )}
+        {!isMine && (
+          <TouchableOpacity
+            style={styles.moreBtn}
+            onPress={() => {
+              // Open the report/block menu. Inline Alert avoids ActionSheet
+              // platform issues — works the same on Android and iOS.
+              Alert.alert(
+                'Post options',
+                `From ${post.profile?.name || 'this user'}`,
+                [
+                  { text: 'Report post',  onPress: () => onReport?.(post), style: 'destructive' },
+                  { text: 'Block user',   onPress: () => onBlock?.(post),  style: 'destructive' },
+                  { text: 'Cancel',       style: 'cancel' },
+                ],
+              );
+            }}
+            activeOpacity={0.7}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={styles.moreBtnText}>⋯</Text>
           </TouchableOpacity>
         )}
       </View>
@@ -295,21 +324,25 @@ const POST_TYPES = [
   { id: 'general',  label: 'General',  color: '#8b5cf6' },
 ];
 
-function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPhotoUri }) {
+function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPhotoUri, initialPhotoB64 }) {
   const colors  = useColors();
   const styles  = useMemo(() => makeStyles(colors), [colors]);
   const [title,    setTitle]    = useState('');
   const [caption,  setCaption]  = useState('');
   const [postType, setPostType] = useState('workout');
   const [photoUri, setPhotoUri] = useState(null);
+  const [photoB64, setPhotoB64] = useState(null);
   const [posting,  setPosting]  = useState(false);
 
   // When opened with a pre-selected photo (from "Photo" speed dial option)
   useEffect(() => {
-    if (visible && initialPhotoUri) setPhotoUri(initialPhotoUri);
-  }, [visible, initialPhotoUri]);
+    if (visible && initialPhotoUri) {
+      setPhotoUri(initialPhotoUri);
+      if (initialPhotoB64) setPhotoB64(initialPhotoB64);
+    }
+  }, [visible, initialPhotoUri, initialPhotoB64]);
 
-  const reset = () => { setTitle(''); setCaption(''); setPostType('workout'); setPhotoUri(null); };
+  const reset = () => { setTitle(''); setCaption(''); setPostType('workout'); setPhotoUri(null); setPhotoB64(null); };
   const close = () => { reset(); onClose(); };
 
   const pickFromGallery = async () => {
@@ -319,9 +352,12 @@ function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPho
       return;
     }
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'], allowsEditing: false, quality: 0.8,
+      mediaTypes: ['images'], allowsEditing: false, quality: 0.8, base64: true,
     });
-    if (!result.canceled) setPhotoUri(result.assets[0].uri);
+    if (!result.canceled) {
+      setPhotoUri(result.assets[0].uri);
+      setPhotoB64(result.assets[0].base64 || null);
+    }
   };
 
   const takePhoto = async () => {
@@ -331,18 +367,31 @@ function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPho
       return;
     }
     const result = await ImagePicker.launchCameraAsync({
-      allowsEditing: false, quality: 0.8,
+      allowsEditing: false, quality: 0.8, base64: true,
     });
-    if (!result.canceled) setPhotoUri(result.assets[0].uri);
+    if (!result.canceled) {
+      setPhotoUri(result.assets[0].uri);
+      setPhotoB64(result.assets[0].base64 || null);
+    }
   };
 
-  const uploadPhoto = async (uri) => {
-    const response = await fetch(uri);
-    const blob = await response.blob();
+  // Convert a base64 string to a Uint8Array. `atob` is a global in modern
+  // React Native / Hermes, so this works with no extra dependencies.
+  const base64ToBytes = (b64) => {
+    const bin = global.atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  };
+
+  const uploadPhoto = async (b64) => {
+    if (!b64) throw new Error('No image data');
+    const bytes = base64ToBytes(b64);
     const fileName = `${myUserId}/${Date.now()}.jpg`;
     const { error } = await supabase.storage
       .from('post-images')
-      .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false });
+      .upload(fileName, bytes, { contentType: 'image/jpeg', upsert: false });
     if (error) throw error;
     const { data: { publicUrl } } = supabase.storage
       .from('post-images')
@@ -357,7 +406,25 @@ function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPho
       const typeLabel = POST_TYPES.find(t => t.id === postType)?.label || 'Post';
       let imageUrl = null;
       if (photoUri) {
-        try { imageUrl = await uploadPhoto(photoUri); } catch { /* post without image */ }
+        if (!photoB64) {
+          Alert.alert(
+            'Photo issue',
+            "We couldn't read that photo. Remove it and pick it again, then try posting.",
+          );
+          setPosting(false);
+          return;
+        }
+        try {
+          imageUrl = await uploadPhoto(photoB64);
+        } catch (err) {
+          if (__DEV__) console.log('Photo upload failed:', err);
+          Alert.alert(
+            'Photo upload failed',
+            (err && err.message) || "We couldn't upload your photo. Check your connection and try again.",
+          );
+          setPosting(false);
+          return;
+        }
       }
       const workoutData = imageUrl ? { image_url: imageUrl } : {};
       const post = await shareWorkout({
@@ -420,7 +487,7 @@ function NewPostModal({ visible, onClose, myUserId, myName, onPosted, initialPho
                 <Image source={{ uri: photoUri }} style={styles.npPhotoBannerImg} resizeMode="cover" />
                 <TouchableOpacity
                   style={[styles.npPhotoRemove, { backgroundColor: 'rgba(0,0,0,0.6)' }]}
-                  onPress={() => setPhotoUri(null)}
+                  onPress={() => { setPhotoUri(null); setPhotoB64(null); }}
                   activeOpacity={0.8}
                 >
                   <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>✕  Remove photo</Text>
@@ -508,6 +575,7 @@ export default function SocialScreen() {
   const [myName, setMyName]       = useState('');
   const [section, setSection]     = useState('feed');
   const [posts, setPosts]         = useState([]);
+  const [followingPosts, setFollowingPosts] = useState([]);
   const [discoverUsers, setDiscoverUsers] = useState([]);
   const [loading, setLoading]     = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -516,10 +584,13 @@ export default function SocialScreen() {
   const [showNewPost,   setShowNewPost]   = useState(false);
   const [fabOpen,       setFabOpen]       = useState(false);
   const [initialPhoto,  setInitialPhoto]  = useState(null);
+  const [initialPhotoB64, setInitialPhotoB64] = useState(null);
   const fabAnim = useRef(new Animated.Value(0)).current;
 
   // Which user IDs we are following (Set for O(1) lookup)
   const [followingIds, setFollowingIds] = useState(new Set());
+  // Which user IDs we have blocked — their posts are filtered out of every feed
+  const [blockedIds, setBlockedIds] = useState(new Set());
 
   // ── Load current user ──
   useEffect(() => {
@@ -550,6 +621,87 @@ export default function SocialScreen() {
     }
   }, [myUserId]);
 
+  // ── Load blocked IDs (for client-side feed filtering) ──
+  const loadBlocked = useCallback(async () => {
+    if (!myUserId) return;
+    try {
+      const ids = await fetchBlockedIds(myUserId);
+      setBlockedIds(ids);
+    } catch (e) {
+      console.error('loadBlocked', e);
+    }
+  }, [myUserId]);
+
+  // ── UGC handlers: report a post, block a user ──
+  const handleReport = useCallback((post) => {
+    if (!myUserId || !post?.id) return;
+    Alert.alert(
+      'Why are you reporting this post?',
+      'Choose the reason that best applies. Reports are anonymous to the poster.',
+      [
+        ...REPORT_REASONS.map(r => ({
+          text: r.label,
+          onPress: async () => {
+            try {
+              await reportPost(post.id, myUserId, r.id);
+              Alert.alert('Reported', 'Thanks — we\'ll review this post. You won\'t see it again on refresh.');
+              // Hide the reported post immediately
+              setPosts(prev => prev.filter(p => p.id !== post.id));
+              setFollowingPosts(prev => prev.filter(p => p.id !== post.id));
+            } catch (e) {
+              Alert.alert('Could not report', e?.message || 'Try again');
+            }
+          },
+        })),
+        { text: 'Cancel', style: 'cancel' },
+      ],
+    );
+  }, [myUserId]);
+
+  const handleBlock = useCallback((post) => {
+    if (!myUserId || !post?.userId) return;
+    const blockedName = post.profile?.name || 'this user';
+    Alert.alert(
+      `Block ${blockedName}?`,
+      'You will no longer see their posts, comments, or profile. They will not be notified.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Block',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await blockUser(myUserId, post.userId);
+              // Optimistically update local state
+              setBlockedIds(prev => new Set([...prev, post.userId]));
+              setPosts(prev => prev.filter(p => p.userId !== post.userId));
+              setFollowingPosts(prev => prev.filter(p => p.userId !== post.userId));
+              setFollowingIds(prev => {
+                const next = new Set(prev);
+                next.delete(post.userId);
+                return next;
+              });
+              setDiscoverUsers(prev => prev.filter(u => u.id !== post.userId));
+            } catch (e) {
+              Alert.alert('Could not block', e?.message || 'Try again');
+            }
+          },
+        },
+      ],
+    );
+  }, [myUserId]);
+
+  // ── Load Following feed (posts only from users I follow) ──
+  const loadFollowing = useCallback(async () => {
+    if (!myUserId) return;
+    try {
+      const data = await fetchFollowingPosts(myUserId);
+      setFollowingPosts(data);
+    } catch (e) {
+      console.error('loadFollowing', e);
+    }
+  }, [myUserId]);
+
   // ── Load discover ──
   const loadDiscover = useCallback(async () => {
     if (!myUserId) return;
@@ -564,13 +716,15 @@ export default function SocialScreen() {
 
   useEffect(() => {
     if (myUserId) {
-      Promise.all([loadFeed(), loadDiscover()]).finally(() => setLoading(false));
+      Promise.all([loadFeed(), loadFollowing(), loadDiscover(), loadBlocked()])
+        .finally(() => setLoading(false));
     }
   }, [myUserId]);
 
   const handleRefresh = () => {
     setRefreshing(true);
-    Promise.all([loadFeed(true), loadDiscover()]).finally(() => setRefreshing(false));
+    Promise.all([loadFeed(true), loadFollowing(), loadDiscover(), loadBlocked()])
+      .finally(() => setRefreshing(false));
   };
 
   // ── Like toggle (optimistic) ──
@@ -617,6 +771,9 @@ export default function SocialScreen() {
     ));
     try {
       await toggleFollowDB(myUserId, targetUserId, isCurrentlyFollowing);
+      // Refresh the Following feed so the new follow's posts appear (or the
+      // unfollowed user's posts disappear) without requiring a pull-to-refresh.
+      loadFollowing();
     } catch {
       // Revert
       setFollowingIds(prev => {
@@ -641,6 +798,7 @@ export default function SocialScreen() {
   const openPost = () => {
     closeFab();
     setInitialPhoto(null);
+    setInitialPhotoB64(null);
     setShowNewPost(true);
   };
   const openPhoto = async () => {
@@ -651,10 +809,11 @@ export default function SocialScreen() {
       return;
     }
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'], allowsEditing: false, quality: 0.8,
+      mediaTypes: ['images'], allowsEditing: false, quality: 0.8, base64: true,
     });
     if (!result.canceled) {
       setInitialPhoto(result.assets[0].uri);
+      setInitialPhotoB64(result.assets[0].base64 || null);
       setShowNewPost(true);
     }
   };
@@ -666,10 +825,11 @@ export default function SocialScreen() {
       return;
     }
     const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ['images'], allowsEditing: false, quality: 0.8,
+      mediaTypes: ['images'], allowsEditing: false, quality: 0.8, base64: true,
     });
     if (!result.canceled) {
       setInitialPhoto(result.assets[0].uri);
+      setInitialPhotoB64(result.assets[0].base64 || null);
       setShowNewPost(true);
     }
   };
@@ -687,13 +847,26 @@ export default function SocialScreen() {
   );
 
   // ── Filtered data for search ──
-  const q = searchQuery.trim().toLowerCase();
+  // Strip a leading "@" so a tester searching "@julieruns" matches the
+  // stored username (which has no "@" prefix).
+  const q = searchQuery.trim().toLowerCase().replace(/^@/, '');
+  // First strip out posts/users the current user has blocked, then apply the
+  // search filter. Blocked users disappear from every surface — feed, following,
+  // discover.
+  const visiblePosts          = posts.filter(p => !blockedIds.has(p.userId));
+  const visibleFollowingPosts = followingPosts.filter(p => !blockedIds.has(p.userId));
+  const visibleDiscoverUsers  = discoverUsers.filter(u => !blockedIds.has(u.id));
   const filteredPosts = q
-    ? posts.filter(p => (p.profile?.name || '').toLowerCase().includes(q) || (p.caption || '').toLowerCase().includes(q))
-    : posts;
+    ? visiblePosts.filter(p =>
+        (p.profile?.name || '').toLowerCase().includes(q)
+        || (p.profile?.username || '').toLowerCase().includes(q)
+        || (p.caption || '').toLowerCase().includes(q))
+    : visiblePosts;
   const filteredUsers = q
-    ? discoverUsers.filter(u => (u.name || '').toLowerCase().includes(q))
-    : discoverUsers;
+    ? visibleDiscoverUsers.filter(u =>
+        (u.name || '').toLowerCase().includes(q)
+        || (u.username || '').toLowerCase().includes(q))
+    : visibleDiscoverUsers;
 
   // ── User profile view ──
   if (viewUserId) {
@@ -737,7 +910,7 @@ export default function SocialScreen() {
           </View>
 
           <View style={styles.tabs}>
-            {[['feed', 'Feed'], ['discover', 'Discover']].map(([id, label]) => (
+            {[['feed', 'For You'], ['following', 'Following'], ['discover', 'Discover']].map(([id, label]) => (
               <TouchableOpacity key={id} style={styles.tab} onPress={() => setSection(id)} activeOpacity={0.8}>
                 <Text style={[styles.tabText, section === id && styles.tabTextActive]}>{label}</Text>
                 {section === id && <View style={styles.tabIndicator} />}
@@ -775,8 +948,56 @@ export default function SocialScreen() {
                   onViewUser={setViewUserId}
                   onFollow={handleFollow}
                   followingIds={followingIds}
+                  onReport={handleReport}
+                  onBlock={handleBlock}
                 />
               ))}
+            </ScrollView>
+          )
+        )}
+
+        {/* Following — posts only from users I follow */}
+        {section === 'following' && (
+          loading ? (
+            <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+              <ActivityIndicator color={colors.accent} size="large" />
+            </View>
+          ) : (
+            <ScrollView
+              contentContainerStyle={styles.scroll}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={colors.accent} />}
+            >
+              {followingPosts.length === 0 ? (
+                <View style={styles.emptyBox}>
+                  <Text style={styles.emptyEmoji}>👥</Text>
+                  <Text style={styles.emptyTitle}>No posts from your follows yet</Text>
+                  <Text style={styles.emptySub}>Find people to follow in the Discover tab and their posts will show up here.</Text>
+                  <TouchableOpacity
+                    style={[styles.followBtn, { marginTop: 16 }]}
+                    onPress={() => setSection('discover')}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={styles.followBtnText}>Go to Discover →</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : visibleFollowingPosts
+                  .filter(p => !q || (p.title || '').toLowerCase().includes(q) || (p.caption || '').toLowerCase().includes(q))
+                  .map(post => (
+                    <PostCard
+                      key={post.id}
+                      post={post}
+                      myUserId={myUserId}
+                      myName={myName}
+                      onLike={handleLike}
+                      onViewUser={setViewUserId}
+                      onFollow={handleFollow}
+                      followingIds={followingIds}
+                      onReport={handleReport}
+                      onBlock={handleBlock}
+                    />
+                  ))}
             </ScrollView>
           )
         )}
@@ -802,6 +1023,7 @@ export default function SocialScreen() {
                 </TouchableOpacity>
                 <TouchableOpacity style={{ flex: 1 }} onPress={() => setViewUserId(u.id)} activeOpacity={0.8}>
                   <Text style={styles.posterName}>{u.name}</Text>
+                  {u.username ? <Text style={styles.discoverHandle}>@{u.username}</Text> : null}
                   <Text style={styles.posterMeta}>{u.level || 'Member'}{u.streak > 0 ? ` · 🔥 ${u.streak} day streak` : ''}</Text>
                   {u.workouts > 0 && <Text style={styles.discoverBio}>{u.workouts} workouts completed</Text>}
                 </TouchableOpacity>
@@ -889,6 +1111,7 @@ export default function SocialScreen() {
         myUserId={myUserId}
         myName={myName}
         initialPhotoUri={initialPhoto}
+        initialPhotoB64={initialPhotoB64}
         onPosted={newPost => {
           setPosts(prev => [newPost, ...prev]);
           setShowNewPost(false);
@@ -952,6 +1175,10 @@ const makeStyles = (colors) => StyleSheet.create({
   profileTop:     { flexDirection: 'row', gap: 16, alignItems: 'flex-start', marginBottom: 16 },
   profileName:    { fontSize: 18, fontWeight: '700', color: colors.text },
   profileBio:     { fontSize: 13, color: colors.text2, marginTop: 4 },
+  profileHandle:  { fontSize: 14, color: colors.accent, fontWeight: '600', marginTop: 2 },
+  discoverHandle: { fontSize: 12, color: colors.accent, fontWeight: '600', marginTop: 1 },
+  moreBtn:        { width: 32, height: 32, alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+  moreBtnText:    { fontSize: 22, color: colors.text3, fontWeight: '700', lineHeight: 22 },
   levelBadge:     { backgroundColor: colors.bg, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 3, alignSelf: 'flex-start', marginTop: 4 },
   levelText:      { fontSize: 11, fontWeight: '600', color: colors.text2 },
   profileStats:   { flexDirection: 'row', paddingVertical: 14, borderTopWidth: 1, borderTopColor: colors.border },

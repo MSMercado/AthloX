@@ -6,13 +6,29 @@ import {
   Animated, Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import * as Location from 'expo-location';
+import {
+  startRunTracking,
+  stopRunTracking,
+  pauseRunTracking,
+  resumeRunTracking,
+  resetRunTracking,
+  getTrackingState,
+} from '../lib/runTracking';
 import useStore from '../store/useStore';
-import { XP_REWARDS } from '../lib/xp';
+import { XP_REWARDS, computeStrengthXP, computeCardioXP } from '../lib/xp';
 import { EXERCISES, SAMPLE_ROUTINES } from '../data/exercises';
 import { TUTORIALS } from '../data/exerciseTutorials';
 import useColors from '../lib/useColors';
+import {
+  saveRunActivity,
+  enqueuePendingRun,
+  computeSplits,
+  computeElevationGain,
+  computeMaxPace,
+  smoothPathKalman,
+} from '../lib/runActivities';
 import { shadow } from '../lib/theme';
 import HeaderActions from '../components/HeaderActions';
 import { supabase } from '../lib/supabase';
@@ -165,6 +181,7 @@ function TutorialModal({ ex, onClose }) {
 
 /* ─── Main Track Screen ─── */
 export default function TrackScreen({ route }) {
+  const navigation = useNavigation();
   const { user, routines, logs, addLog, addXP } = useStore();
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
@@ -175,6 +192,16 @@ export default function TrackScreen({ route }) {
       startStrength(route.params.startRoutine);
     }
   }, [route?.params?.startRoutine]);
+
+  // Handle a run day launched from the Plan tab — autostart the GPS run flow
+  // (gps-setup → signal acquire → countdown → active) instead of dropping the
+  // user on the Workout home screen. startRunAt changes every tap so re-runs
+  // re-trigger this effect.
+  React.useEffect(() => {
+    if (route?.params?.startRun) {
+      startGps(route.params.startRun);
+    }
+  }, [route?.params?.startRun, route?.params?.startRunAt]);
 
   /* ─ Core state ─ */
   const [mode, setMode]           = useState('home');
@@ -201,6 +228,12 @@ export default function TrackScreen({ route }) {
   const [currentPace, setCurrentPace] = useState(null);
   const paceBufferRef = useRef([]); // rolling 30-sec window of {dist, time}
 
+  /* ─ GPS path capture (v1.1.0 Run Summary) ─ */
+  // Every position fix during gps-active is appended as { lat, lng, alt, ts }.
+  // Reset at run start, used to draw the route map + per-km splits + charts.
+  const pathRef       = useRef([]);
+  const runStartTsRef = useRef(null);
+
   /* ─ Refs ─ */
   const timerRef    = useRef(null);
   const watchRef    = useRef(null);
@@ -221,14 +254,28 @@ export default function TrackScreen({ route }) {
   const doneSets  = Object.values(sets).filter(Boolean).length;
   const wKg  = user?.units === 'imperial' ? (parseFloat(user?.weight) || 154) / 2.205 : (parseFloat(user?.weight) || 70);
   const strCal = estimateCals(elapsed, wKg, user?.level);
-  const met    = gpsAct === 'bike' ? 6 : gpsAct === 'walk' ? 3.5 : gpsAct === 'hike' ? 5.3 : 8;
-  const gpsCal = Math.round(met * wKg * (elapsed / 3600));
+  // Calorie cost per kg of body weight per kilometre travelled. Distance-based
+  // so calories don't accumulate when the user is stationary (e.g. timer running
+  // but not actually moving). Coefficients are standard physio approximations.
+  const KCAL_PER_KG_PER_KM = { run: 0.95, walk: 0.55, hike: 0.70, bike: 0.30 };
+  const gpsCalDist = (KCAL_PER_KG_PER_KM[gpsAct] || 0.95) * wKg * gpsDist;
+  // Time-based fallback floor: gives a small reading even if GPS is slow to lock,
+  // but capped so a stationary user can't run away with calories. Equivalent to
+  // ~3 MET × weight × hours, which is roughly resting + light activity baseline.
+  const gpsCalMin  = 3 * wKg * (elapsed / 3600);
+  // Use distance-based calories when there's meaningful movement (>50m); fall
+  // back to the conservative time-based floor while GPS is acquiring.
+  const gpsCal = Math.round(gpsDist > 0.05 ? gpsCalDist : gpsCalMin);
 
   // Sync pausedRef
   useEffect(() => {
     const was = pausedRef.current;
     pausedRef.current = paused;
     if (was && !paused) lastPosRef.current = null;
+    // Mirror the pause state into the foreground service's task buffer so
+    // background-collected points stop accumulating while the user is paused.
+    if (paused) pauseRunTracking();
+    else        resumeRunTracking();
   }, [paused]);
 
   // Timer — only runs during active workout/GPS
@@ -241,56 +288,98 @@ export default function TrackScreen({ route }) {
     return () => clearInterval(timerRef.current);
   }, [mode, paused]);
 
-  // GPS watch — starts on gps-setup, keeps running through countdown + active, stops on non-GPS modes
+  // ── GPS tracking lifecycle (v1.2.0 background-aware) ──────────────────────
+  // The actual location sampling now happens inside a registered TaskManager
+  // task (see lib/runTracking.js), which runs inside an Android foreground
+  // service so it survives the app being backgrounded or the screen locking.
+  // This effect just controls the lifecycle (start/stop) based on screen mode,
+  // and a separate effect drains the module buffer into React state for the UI.
+  const drainedIdxRef = useRef(0);
   useEffect(() => {
     const GPS_MODES = ['gps-setup', 'gps-countdown', 'gps-active'];
 
+    // Leaving GPS modes entirely — tear down the foreground service.
     if (!GPS_MODES.includes(mode)) {
-      watchRef.current?.remove();
+      // Cancel out the legacy watch ref if it somehow survived (defensive)
+      watchRef.current?.remove?.();
       watchRef.current = null;
       lastPosRef.current = null;
       setGpsSignal('acquiring');
+      // Ignore failures — the service may already be stopped
+      stopRunTracking().catch(() => {});
       return;
     }
 
-    // Already watching (switching between GPS modes) — don't restart
-    if (watchRef.current) return;
+    // Already running — don't restart on mode-to-mode transitions
+    if (watchRef.current === 'foreground-service-active') return;
 
     (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        setGpsErr('Location permission denied — enable it in Settings');
+      try {
+        setGpsErr(null);
+        setGpsSignal('acquiring');
+        await startRunTracking();
+        // Mark the "watch" as active so subsequent mode changes don't restart it
+        watchRef.current = 'foreground-service-active';
+        setGpsSignal('active');
+      } catch (err) {
+        const msg = err?.message || 'GPS error';
+        if (msg === 'PERMISSION_FOREGROUND_DENIED') {
+          setGpsErr('Location permission denied — enable it in Settings');
+        } else if (msg === 'PERMISSION_BACKGROUND_DENIED') {
+          setGpsErr('Background location denied — enable "Allow all the time" in Settings so AthloX can keep tracking when your screen is off.');
+        } else {
+          setGpsErr(`GPS error: ${msg}`);
+        }
         setGpsSignal('error');
-        return;
       }
-      setGpsErr(null);
-      setGpsSignal('acquiring');
-      watchRef.current = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 2 },
-        pos => {
-          setGpsSignal('active');
-          const newPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-          // Only accumulate distance when actively running (not setup/countdown)
-          if (modeRef.current === 'gps-active' && !pausedRef.current && lastPosRef.current) {
-            const d = haversine(lastPosRef.current.lat, lastPosRef.current.lng, newPos.lat, newPos.lng);
-            if (d < 0.1) { distRef.current += d; setGpsDist(distRef.current); }
-          }
-          if (modeRef.current === 'gps-active' && !pausedRef.current) {
-            lastPosRef.current = newPos;
-            // Rolling 30-second pace window
-            const now = Date.now();
-            paceBufferRef.current.push({ dist: distRef.current, time: now });
-            paceBufferRef.current = paceBufferRef.current.filter(p => now - p.time <= 30000);
-            if (paceBufferRef.current.length >= 2) {
-              const oldest = paceBufferRef.current[0];
-              const distDelta = distRef.current - oldest.dist; // km
-              const timeDelta = (now - oldest.time) / 60000;  // minutes
-              if (distDelta > 0.005) setCurrentPace(timeDelta / distDelta);
-            }
+    })();
+  }, [mode]);
+
+  // Drain points from the module buffer into React state every 500ms while
+  // the run is active. We only consume new points (drainedIdxRef tracks how
+  // many we've already pulled), and we only update distance / pace / pathRef
+  // when the user is in gps-active and not paused — same behaviour as v1.1.0.
+  useEffect(() => {
+    if (mode !== 'gps-active') {
+      drainedIdxRef.current = 0;
+      return;
+    }
+    const id = setInterval(() => {
+      if (pausedRef.current) return;
+      const { points } = getTrackingState();
+      if (!points || points.length <= drainedIdxRef.current) return;
+      const fresh = points.slice(drainedIdxRef.current);
+      drainedIdxRef.current = points.length;
+      for (const p of fresh) {
+        const newPos = { lat: p.lat, lng: p.lng };
+        if (lastPosRef.current) {
+          const d = haversine(lastPosRef.current.lat, lastPosRef.current.lng, newPos.lat, newPos.lng);
+          // Same noise filter as v1.1.0 — drop suspicious large jumps
+          if (d < 0.1) {
+            distRef.current += d;
           }
         }
-      );
-    })();
+        lastPosRef.current = newPos;
+        // Mirror into the post-run summary path buffer
+        pathRef.current.push({
+          lat: p.lat, lng: p.lng,
+          alt: p.alt,
+          ts:  p.ts,
+        });
+        // Rolling 30-second pace window
+        const now = p.ts;
+        paceBufferRef.current.push({ dist: distRef.current, time: now });
+        paceBufferRef.current = paceBufferRef.current.filter(b => now - b.time <= 30000);
+        if (paceBufferRef.current.length >= 2) {
+          const oldest = paceBufferRef.current[0];
+          const distDelta = distRef.current - oldest.dist;
+          const timeDelta = (now - oldest.time) / 60000;
+          if (distDelta > 0.005) setCurrentPace(timeDelta / distDelta);
+        }
+      }
+      setGpsDist(distRef.current);
+    }, 500);
+    return () => clearInterval(id);
   }, [mode]);
 
   // GPS countdown: 3 → 2 → 1 → GO (enters gps-active)
@@ -314,6 +403,8 @@ export default function TrackScreen({ route }) {
       setElapsed(0);
       distRef.current = 0;
       lastPosRef.current = null;
+      pathRef.current = [];                  // fresh path for this run
+      runStartTsRef.current = Date.now();    // exact start moment for the summary
       setGpsDist(0);
       setMode('gps-active');
     }, 3000);
@@ -321,11 +412,40 @@ export default function TrackScreen({ route }) {
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
   }, [mode]);
 
+  // Strength countdown: 3 → 2 → 1 → GO (enters str-active)
+  useEffect(() => {
+    if (mode !== 'str-countdown') return;
+    setCountdownNum(3);
+    countdownAnim.setValue(0.2);
+    Animated.spring(countdownAnim, { toValue: 1, tension: 180, friction: 7, useNativeDriver: true }).start();
+
+    const t1 = setTimeout(() => {
+      setCountdownNum(2);
+      countdownAnim.setValue(0.2);
+      Animated.spring(countdownAnim, { toValue: 1, tension: 180, friction: 7, useNativeDriver: true }).start();
+    }, 1000);
+    const t2 = setTimeout(() => {
+      setCountdownNum(1);
+      countdownAnim.setValue(0.2);
+      Animated.spring(countdownAnim, { toValue: 1, tension: 180, friction: 7, useNativeDriver: true }).start();
+    }, 2000);
+    const t3 = setTimeout(() => {
+      setElapsed(0);
+      setMode('str-active');
+    }, 3000);
+
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+  }, [mode]);
+
   const reset = () => {
-    watchRef.current?.remove(); watchRef.current = null;
+    watchRef.current?.remove?.(); watchRef.current = null;
     clearInterval(timerRef.current);
     lastPosRef.current = null; distRef.current = 0;
     paceBufferRef.current = [];
+    pathRef.current = [];
+    drainedIdxRef.current = 0;
+    // Tear down the foreground service if it's still running
+    resetRunTracking().catch(() => {});
     setMode('home'); setElapsed(0); setPaused(false);
     setSets({}); setSelR(null); setGpsDist(0);
     setGpsErr(null); setGpsSignal('acquiring');
@@ -366,6 +486,10 @@ export default function TrackScreen({ route }) {
 
   const removeFromBuilder = (exId) => {
     setBuilderExs(prev => prev.filter(e => e.id !== exId));
+  };
+
+  const updateBuilderEx = (exId, patch) => {
+    setBuilderExs(prev => prev.map(e => (e.id === exId ? { ...e, ...patch } : e)));
   };
 
   const getCategoryExercises = (catId) => EXERCISES.filter(ex => ex.muscle === catId);
@@ -447,13 +571,69 @@ export default function TrackScreen({ route }) {
   };
 
   const finishGps = () => {
-    watchRef.current?.remove(); watchRef.current = null;
+    watchRef.current?.remove?.(); watchRef.current = null;
+    // Tear down the foreground service — captured points are already mirrored
+    // into pathRef.current via the drain interval above, so we can stop safely.
+    stopRunTracking().catch(() => {});
     setMode('gps-done');
     const isFirst = logs.length === 0;
-    addLog({ id: Date.now(), date: todayStr(), ts: Date.now(), routine: `${curAct.label} — ${fmtDist(gpsDist)}`, duration: Math.round(elapsed / 60), calories: gpsCal, distance: +gpsDist.toFixed(2), type: 'cardio' });
-    let xp = XP_REWARDS.LOG_RUN;
-    if (isFirst) xp += XP_REWARDS.FIRST_WORKOUT;
-    addXP(xp);
+    const logId = Date.now();
+    addLog({ id: logId, date: todayStr(), ts: Date.now(), routine: `${curAct.label} — ${fmtDist(gpsDist)}`, duration: Math.round(elapsed / 60), calories: gpsCal, distance: +gpsDist.toFixed(2), type: 'cardio' });
+    // Effort-based XP: proportional to distance + time, with anti-exploit gates.
+    // A 1-second stop will award 0 XP. A real 5K in 30 min = ~80 XP.
+    let xp = computeCardioXP(gpsDist, elapsed);
+    if (xp > 0 && isFirst) xp += XP_REWARDS.FIRST_WORKOUT;
+    if (xp > 0) addXP(xp);
+
+    // Build the run activity object and persist + navigate to summary.
+    // Done in fire-and-forget mode so a Supabase blip doesn't block the UI.
+    const rawPath = [...pathRef.current];
+    if (rawPath.length >= 2) {
+      // Kalman-smooth before persisting. Splits / elevation / max pace are
+      // computed from the smoothed path so the saved numbers match the route
+      // the user sees on the map.
+      const path = smoothPathKalman(rawPath);
+      const startedAt = new Date(runStartTsRef.current || Date.now() - elapsed * 1000).toISOString();
+      const splits = computeSplits(path);
+      const elevationGainM = computeElevationGain(path);
+      const maxPaceMinPerKm = computeMaxPace(path);
+      const avgPaceMinPerKm = gpsDist > 0.01 ? Number(((elapsed / 60) / gpsDist).toFixed(2)) : null;
+      const activity = {
+        activityType:    (curAct?.label || 'Run').toLowerCase(),
+        startedAt,
+        durationSec:     elapsed,
+        distanceKm:      Number(gpsDist.toFixed(3)),
+        avgPaceMinPerKm,
+        maxPaceMinPerKm,
+        elevationGainM,
+        calories:        gpsCal,
+        path,
+        splits,
+      };
+      saveRunActivity(activity)
+        .then(saved => {
+          // Stitch the run_activities row id back onto the local log entry so
+          // taps from Today's "Recent Activity" can re-open the rich summary.
+          const updatedLogs = useStore.getState().logs.map(l =>
+            l.id === logId ? { ...l, runActivityId: saved.id } : l
+          );
+          useStore.setState({ logs: updatedLogs });
+          // Persist the patched logs array
+          import('@react-native-async-storage/async-storage').then(({ default: AS }) =>
+            AS.setItem('wb_logs', JSON.stringify(updatedLogs)).catch(() => {})
+          );
+          // Navigate to the rich summary screen (drops the basic gps-done screen).
+          navigation.navigate('RunSummary', { activityId: saved.id });
+        })
+        .catch(err => {
+          // Save failed (most likely no internet on a trail run). Queue the
+          // activity so it'll be saved on next foreground/login. The user
+          // keeps their basic gps-done summary in the meantime — they won't
+          // lose the run.
+          console.warn('[TrackScreen] saveRunActivity failed, queuing for retry:', err?.message);
+          enqueuePendingRun(activity);
+        });
+    }
   };
 
   const finishStrength = () => {
@@ -461,9 +641,11 @@ export default function TrackScreen({ route }) {
     setMode('str-done');
     const isFirst = logs.length === 0;
     addLog({ id: Date.now(), date: todayStr(), ts: Date.now(), routine: selR?.name || 'Workout', duration: Math.round(elapsed / 60), calories: strCal, type: 'strength' });
-    let xp = XP_REWARDS.COMPLETE_WORKOUT;
-    if (isFirst) xp += XP_REWARDS.FIRST_WORKOUT;
-    addXP(xp);
+    // Effort-based XP: scales with sets completed, requires >= 1 min + 25% of sets.
+    // Stopping after 1 second awards 0 XP. Half-finished workout awards half XP.
+    let xp = computeStrengthXP(doneSets, totalSets, elapsed);
+    if (xp > 0 && isFirst) xp += XP_REWARDS.FIRST_WORKOUT;
+    if (xp > 0) addXP(xp);
   };
 
   /* ══════════════════════════════════════════════════════════════
@@ -729,7 +911,7 @@ export default function TrackScreen({ route }) {
             );
           })}
           <View style={{ height: 16 }} />
-          <TouchableOpacity style={styles.btnAccent} onPress={() => { setSets({}); setElapsed(0); setPaused(false); setMode('str-active'); }}>
+          <TouchableOpacity style={styles.btnAccent} onPress={() => { setSets({}); setElapsed(0); setPaused(false); setMode('str-countdown'); }}>
             <Text style={styles.btnAccentText}>▶ Start Workout</Text>
           </TouchableOpacity>
           <TouchableOpacity style={[styles.closeBtn, { marginTop: 10 }]} onPress={reset}>
@@ -738,6 +920,21 @@ export default function TrackScreen({ route }) {
         </ScrollView>
       </SafeAreaView>
       <TutorialModal ex={tutorialEx} onClose={() => setTutorialEx(null)} />
+    </View>
+  );
+
+  /* ══════════════════════════════════════════════════════════════
+     RENDER — Strength Countdown (3-2-1)
+  ══════════════════════════════════════════════════════════════ */
+  if (mode === 'str-countdown' && selR) return (
+    <View style={styles.darkScreen}>
+      <SafeAreaView style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+        <Text style={styles.countdownLabel}>Get Ready!</Text>
+        <Animated.Text style={[styles.countdownNumber, { transform: [{ scale: countdownAnim }] }]}>
+          {countdownNum}
+        </Animated.Text>
+        <Text style={styles.countdownSub}>{(selR.name || 'WORKOUT').toUpperCase()} — GO!</Text>
+      </SafeAreaView>
     </View>
   );
 
@@ -942,28 +1139,69 @@ export default function TrackScreen({ route }) {
             </Text>
           </View>
         ) : (
-          builderExs.map((ex, idx) => (
-            <View key={ex.id || idx} style={[styles.card, styles.builderRow]}>
-              <View style={styles.exNum}>
-                <Text style={styles.exNumText}>{idx + 1}</Text>
+          builderExs.map((ex, idx) => {
+            const sets = typeof ex.sets === 'number' ? ex.sets : 3;
+            const reps = ex.reps != null ? String(ex.reps) : '10–12';
+            return (
+              <View key={ex.id || idx} style={[styles.card, styles.builderRow]}>
+                <View style={{ flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10 }}>
+                  <View style={styles.exNum}>
+                    <Text style={styles.exNumText}>{idx + 1}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.exName}>{ex.name}</Text>
+                    <Text style={styles.exMeta}>{ex.muscle}</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    <TouchableOpacity style={styles.infoBtn} onPress={() => setTutorialEx(ex)}>
+                      <Text style={styles.infoBtnText}>ⓘ</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.infoBtn, { borderColor: '#fca5a5' }]}
+                      onPress={() => removeFromBuilder(ex.id)}
+                    >
+                      <Text style={{ fontSize: 16, color: '#ef4444' }}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Sets / reps editor */}
+                <View style={styles.builderControlsRow}>
+                  <View style={styles.builderControlGroup}>
+                    <Text style={styles.builderControlLabel}>Sets</Text>
+                    <View style={styles.stepper}>
+                      <TouchableOpacity
+                        style={styles.stepBtn}
+                        onPress={() => updateBuilderEx(ex.id, { sets: Math.max(1, sets - 1) })}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={styles.stepBtnText}>−</Text>
+                      </TouchableOpacity>
+                      <Text style={styles.stepValue}>{sets}</Text>
+                      <TouchableOpacity
+                        style={styles.stepBtn}
+                        onPress={() => updateBuilderEx(ex.id, { sets: Math.min(10, sets + 1) })}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={styles.stepBtnText}>+</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                  <View style={[styles.builderControlGroup, { flex: 1 }]}>
+                    <Text style={styles.builderControlLabel}>Reps</Text>
+                    <TextInput
+                      style={styles.repsInput}
+                      value={reps}
+                      onChangeText={(v) => updateBuilderEx(ex.id, { reps: v })}
+                      placeholder="e.g. 10–12"
+                      placeholderTextColor={colors.text3}
+                      maxLength={12}
+                    />
+                  </View>
+                </View>
               </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.exName}>{ex.name}</Text>
-                <Text style={styles.exMeta}>{ex.muscle} · 3 sets × {ex.reps || '10–12'} reps</Text>
-              </View>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <TouchableOpacity style={styles.infoBtn} onPress={() => setTutorialEx(ex)}>
-                  <Text style={styles.infoBtnText}>ⓘ</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.infoBtn, { borderColor: '#fca5a5' }]}
-                  onPress={() => removeFromBuilder(ex.id)}
-                >
-                  <Text style={{ fontSize: 16, color: '#ef4444' }}>✕</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          ))
+            );
+          })
         )}
 
         {/* Add more exercises */}
@@ -1228,7 +1466,15 @@ const makeStyles = (colors) => StyleSheet.create({
   floatingBarBtnText: { fontSize: 13, fontWeight: '700', color: '#fff' },
 
   // Workout builder screen
-  builderRow:      { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, marginBottom: 8 },
+  builderRow:      { padding: 14, marginBottom: 8 },
+  builderControlsRow:    { flexDirection: 'row', gap: 12, alignItems: 'flex-end' },
+  builderControlGroup:   { gap: 6 },
+  builderControlLabel:   { fontSize: 11, fontWeight: '700', color: colors.text3, textTransform: 'uppercase', letterSpacing: 0.5 },
+  stepper:               { flexDirection: 'row', alignItems: 'center', backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: 10, overflow: 'hidden' },
+  stepBtn:               { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
+  stepBtnText:           { fontSize: 20, fontWeight: '700', color: colors.accent, lineHeight: 22 },
+  stepValue:             { minWidth: 36, textAlign: 'center', fontSize: 15, fontWeight: '700', color: colors.text },
+  repsInput:             { backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: 10, height: 36, paddingHorizontal: 12, fontSize: 14, color: colors.text },
   clearBtn:        { paddingHorizontal: 12, paddingVertical: 6 },
   clearBtnText:    { fontSize: 14, color: '#ef4444', fontWeight: '600' },
   startBar:        { position: 'absolute', bottom: 0, left: 0, right: 0, padding: 16, paddingBottom: 28, borderTopWidth: 1 },
