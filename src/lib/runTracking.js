@@ -27,6 +27,7 @@ const tracking = {
   paused: false,
   points: [],          // [{ lat, lng, alt, ts, accuracy }]
   startedAt: 0,
+  activityType: 'run', // run | walk | hike | bike — drives the speed filter
 };
 
 // Tunable noise filters. Three layers stack to clean up raw GPS:
@@ -37,12 +38,20 @@ const tracking = {
 //      starts. The GPS chip is still acquiring satellites and even "good"
 //      fixes during this window are unreliable.
 //   3. MAX_SPEED_MPS     — reject any fix whose implied speed (vs the previous
-//      kept fix) exceeds this. Catches urban-canyon teleport spikes. 12 m/s
-//      is ~43 km/h — comfortably above world-class sprint pace, well below
-//      anything cars/cycles/etc could produce by accident.
+//      kept fix) exceeds this. Catches urban-canyon teleport spikes. Per
+//      activity because a cycling descent regularly exceeds running's
+//      reasonable ceiling — using the run threshold for bike was silently
+//      dropping every fix faster than ~43 km/h, freezing distance + leaving
+//      the route empty in analytics.
 const ACCURACY_FLOOR_M = 20;
 const WARMUP_MS        = 3000;
-const MAX_SPEED_MPS    = 12;
+const MAX_SPEED_BY_ACT = {
+  run:  12, // ~43 km/h — above world-class sprint
+  walk: 12, // kept at run's threshold to avoid regressing legitimate urban
+  hike: 12, // GPS jitter that exceeds walking speed but isn't a teleport
+  bike: 25, // ~90 km/h — generous for descents + sprints
+};
+const DEFAULT_MAX_SPEED_MPS = 12;
 
 // Quick haversine for the speed-filter check below. Returns metres.
 function haversineM(a, b) {
@@ -86,14 +95,15 @@ TaskManager.defineTask(RUN_TRACKING_TASK, ({ data, error }) => {
     };
 
     // Filter 3 — max-speed gate. If the implied speed vs the last kept point
-    // exceeds MAX_SPEED_MPS, this is almost certainly a GPS teleport, not real
-    // motion. Drop it. (Skip on the first kept point, which has nothing to
-    // compare against.)
+    // exceeds the per-activity ceiling, this is almost certainly a GPS
+    // teleport, not real motion. Drop it. (Skip on the first kept point,
+    // which has nothing to compare against.)
     const last = tracking.points[tracking.points.length - 1];
     if (last) {
       const distM = haversineM(last, candidate);
       const dt    = (candidate.ts - last.ts) / 1000;
-      if (dt > 0 && (distM / dt) > MAX_SPEED_MPS) continue;
+      const maxSpeed = MAX_SPEED_BY_ACT[tracking.activityType] || DEFAULT_MAX_SPEED_MPS;
+      if (dt > 0 && (distM / dt) > maxSpeed) continue;
     }
 
     tracking.points.push(candidate);
@@ -104,8 +114,11 @@ TaskManager.defineTask(RUN_TRACKING_TASK, ({ data, error }) => {
  * Request both foreground AND background location permissions, then start the
  * foreground service. Throws on permission denial — caller (TrackScreen) maps
  * the error message to the existing permission-denied UI.
+ *
+ * @param {string} activityType - 'run' | 'walk' | 'hike' | 'bike'. Drives
+ *   the per-activity max-speed filter and the foreground notification text.
  */
-export async function startRunTracking() {
+export async function startRunTracking(activityType = 'run') {
   const fg = await Location.requestForegroundPermissionsAsync();
   if (fg.status !== 'granted') {
     throw new Error('PERMISSION_FOREGROUND_DENIED');
@@ -123,6 +136,12 @@ export async function startRunTracking() {
   tracking.paused = false;
   tracking.points = [];
   tracking.startedAt = Date.now();
+  tracking.activityType = activityType;
+
+  // Activity-specific notification copy. Falls back to "activity" if an
+  // unknown type comes through.
+  const ACT_LABEL = { run: 'run', walk: 'walk', hike: 'hike', bike: 'bike ride' };
+  const label = ACT_LABEL[activityType] || 'activity';
 
   // Defensive: if a previous task is somehow still registered, kill it first
   if (await Location.hasStartedLocationUpdatesAsync(RUN_TRACKING_TASK)) {
@@ -136,7 +155,7 @@ export async function startRunTracking() {
     pausesUpdatesAutomatically: false, // keep going even if user stops moving
     showsBackgroundLocationIndicator: true,
     foregroundService: {
-      notificationTitle:   'AthloX — tracking your run',
+      notificationTitle:   `AthloX — tracking your ${label}`,
       notificationBody:    'Distance, pace, and time are being recorded. Tap to return.',
       notificationColor:   '#FF6B00',
     },

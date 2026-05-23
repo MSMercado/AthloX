@@ -33,6 +33,8 @@ import { shadow } from '../lib/theme';
 import HeaderActions from '../components/HeaderActions';
 import { supabase } from '../lib/supabase';
 import { shareWorkout } from '../lib/community';
+import { updateWorkoutNotification, clearWorkoutNotification } from '../lib/workoutNotification';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
 
@@ -317,7 +319,10 @@ export default function TrackScreen({ route }) {
       try {
         setGpsErr(null);
         setGpsSignal('acquiring');
-        await startRunTracking();
+        // Pass the activity so the per-activity speed filter + notification
+        // copy match what the user actually picked (bike was being silently
+        // capped at 12 m/s = ~43 km/h before this).
+        await startRunTracking(gpsAct);
         // Mark the "watch" as active so subsequent mode changes don't restart it
         watchRef.current = 'foreground-service-active';
         setGpsSignal('active');
@@ -381,6 +386,24 @@ export default function TrackScreen({ route }) {
     }, 500);
     return () => clearInterval(id);
   }, [mode]);
+
+  // Live lock-screen notification — ticks elapsed + distance every second so
+  // the user can see workout progress without unlocking the phone. Uses refs
+  // (not state deps) so the interval doesn't re-create every tick.
+  const elapsedRef = useRef(0);
+  useEffect(() => { elapsedRef.current = elapsed; }, [elapsed]);
+  useEffect(() => {
+    if (mode !== 'gps-active') return;
+    const label = curAct?.label || 'Workout';
+    const post = () => updateWorkoutNotification({
+      activityLabel: label,
+      elapsedSec:    elapsedRef.current,
+      distanceKm:    distRef.current,
+    });
+    post(); // post immediately so user sees the live tile right away
+    const id = setInterval(post, 1000);
+    return () => clearInterval(id);
+  }, [mode, curAct?.label]);
 
   // GPS countdown: 3 → 2 → 1 → GO (enters gps-active)
   useEffect(() => {
@@ -446,6 +469,7 @@ export default function TrackScreen({ route }) {
     drainedIdxRef.current = 0;
     // Tear down the foreground service if it's still running
     resetRunTracking().catch(() => {});
+    clearWorkoutNotification();
     setMode('home'); setElapsed(0); setPaused(false);
     setSets({}); setSelR(null); setGpsDist(0);
     setGpsErr(null); setGpsSignal('acquiring');
@@ -462,7 +486,37 @@ export default function TrackScreen({ route }) {
     distRef.current = 0;
     lastPosRef.current = null;
     setGpsSignal('acquiring');
+    maybeShowBatteryWarning();
     setMode('gps-setup');
+  };
+
+  // One-time guidance shown before a tester's first GPS workout. Android OEM
+  // battery optimization (Samsung One UI, Xiaomi MIUI, Huawei EMUI especially)
+  // aggressively kills background processes — even foreground services —
+  // unless the app is whitelisted. Symptom: timer + distance freeze on lock.
+  // Showing the warning + a one-tap Settings link is the only reliable
+  // mitigation (can't be fixed code-side). AsyncStorage flag prevents
+  // re-nagging on every workout.
+  const maybeShowBatteryWarning = async () => {
+    // OEM background-kill is an Android-only problem. iOS handles long-running
+    // background location cleanly; no need to warn iOS testers about settings
+    // that don't apply to them.
+    if (Platform.OS !== 'android') return;
+    try {
+      const shown = await AsyncStorage.getItem('wb_battery_warning_shown');
+      if (shown) return;
+      Alert.alert(
+        'Keep AthloX tracking when locked',
+        'Some Android phones (Samsung, Xiaomi, Huawei especially) pause background apps when the screen turns off — which can stop your workout from being tracked.\n\nFor accurate distance + time on long workouts:\n• Allow AthloX unrestricted background activity\n• Disable battery optimization for AthloX\n\nYou only need to do this once.',
+        [
+          { text: 'Maybe later', style: 'cancel' },
+          { text: 'Open Settings', onPress: () => Linking.openSettings() },
+        ],
+      );
+      await AsyncStorage.setItem('wb_battery_warning_shown', '1');
+    } catch {
+      // Silent — not critical to the workout flow
+    }
   };
 
   const startBuilderWorkout = () => {
@@ -575,6 +629,7 @@ export default function TrackScreen({ route }) {
     // Tear down the foreground service — captured points are already mirrored
     // into pathRef.current via the drain interval above, so we can stop safely.
     stopRunTracking().catch(() => {});
+    clearWorkoutNotification();
     setMode('gps-done');
     const isFirst = logs.length === 0;
     const logId = Date.now();
