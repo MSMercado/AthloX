@@ -14,6 +14,7 @@ import ProfileScreen    from '../screens/ProfileScreen';
 import CoachScreen      from '../screens/CoachScreen';
 import RunSummaryScreen from '../screens/RunSummaryScreen';
 import CircuitTimerScreen from '../screens/CircuitTimerScreen';
+import ActivitiesScreen   from '../screens/ActivitiesScreen';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -25,19 +26,24 @@ const Stack = createNativeStackNavigator();
 const USING_CUSTOM_ICONS = true;
 
 const TAB_ICONS = USING_CUSTOM_ICONS ? {
-  Dashboard: require('../../assets/tab-today.png'),
-  Workout:   require('../../assets/tab-workouts.png'),
-  Plan:      require('../../assets/tab-plan.png'),
-  Social:    require('../../assets/tab-community.png'),
-  Coach:     require('../../assets/tab-coach.png'),
+  Dashboard:  require('../../assets/tab-today.png'),
+  Workout:    require('../../assets/tab-workouts.png'),
+  Plan:       require('../../assets/tab-plan.png'),
+  Activities: require('../../assets/tab-workouts.png'), // TODO: dedicated icon
+  Social:     require('../../assets/tab-community.png'),
+  Coach:      require('../../assets/tab-coach.png'),
 } : null;
 
+// v2.0 interim: 6 tabs while we transition. After the merged Plan+Workout
+// tab ships, Workout will be removed from the tab bar (still callable as a
+// stack route for backwards-compat with existing nav calls).
 const TABS = [
-  { name: 'Dashboard', component: DashboardScreen, label: 'Today',     emoji: '🏠'  },
-  { name: 'Workout',   component: TrackScreen,     label: 'Workout',   emoji: '🏋️' },
-  { name: 'Plan',      component: PlanScreen,      label: 'Plan',      emoji: '📋'  },
-  { name: 'Social',    component: SocialScreen,    label: 'Community', emoji: '👥'  },
-  { name: 'Coach',     component: CoachScreen,     label: 'Coach',     emoji: '✨'  },
+  { name: 'Dashboard',  component: DashboardScreen,  label: 'Today',      emoji: '🏠'  },
+  { name: 'Workout',    component: TrackScreen,      label: 'Workout',    emoji: '🏋️' },
+  { name: 'Plan',       component: PlanScreen,       label: 'Plan',       emoji: '📋'  },
+  { name: 'Activities', component: ActivitiesScreen, label: 'Activities', emoji: '📊'  },
+  { name: 'Social',     component: SocialScreen,     label: 'Community',  emoji: '👥'  },
+  { name: 'Coach',      component: CoachScreen,      label: 'Coach',      emoji: '✨'  },
 ];
 
 function MainTabs() {
