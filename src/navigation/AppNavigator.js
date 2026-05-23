@@ -17,6 +17,7 @@ import CircuitTimerScreen from '../screens/CircuitTimerScreen';
 import ActivitiesScreen   from '../screens/ActivitiesScreen';
 import StrengthDetailScreen from '../screens/StrengthDetailScreen';
 import ShoesScreen           from '../screens/ShoesScreen';
+import PresetPlanLibraryScreen from '../screens/PresetPlanLibraryScreen';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -29,19 +30,19 @@ const USING_CUSTOM_ICONS = true;
 
 const TAB_ICONS = USING_CUSTOM_ICONS ? {
   Dashboard:  require('../../assets/tab-today.png'),
-  Workout:    require('../../assets/tab-workouts.png'),
   Plan:       require('../../assets/tab-plan.png'),
   Activities: require('../../assets/tab-workouts.png'), // TODO: dedicated icon
   Social:     require('../../assets/tab-community.png'),
   Coach:      require('../../assets/tab-coach.png'),
 } : null;
 
-// v2.0 interim: 6 tabs while we transition. After the merged Plan+Workout
-// tab ships, Workout will be removed from the tab bar (still callable as a
-// stack route for backwards-compat with existing nav calls).
+// v2.0 final: 5 tabs. Workout is no longer in the tab bar — it's a stack
+// route so navigation.navigate('Workout', { startRun: ... }) still works
+// for the Plan tab's run-day Start button and the Activities '+' action
+// sheet. Workout execution is reached from inside flows, not as a
+// destination.
 const TABS = [
   { name: 'Dashboard',  component: DashboardScreen,  label: 'Today',      emoji: '🏠'  },
-  { name: 'Workout',    component: TrackScreen,      label: 'Workout',    emoji: '🏋️' },
   { name: 'Plan',       component: PlanScreen,       label: 'Plan',       emoji: '📋'  },
   { name: 'Activities', component: ActivitiesScreen, label: 'Activities', emoji: '📊'  },
   { name: 'Social',     component: SocialScreen,     label: 'Community',  emoji: '👥'  },
@@ -105,6 +106,10 @@ export default function AppNavigator() {
       <Stack.Screen name="CircuitTimer" component={CircuitTimerScreen}/>
       <Stack.Screen name="StrengthDetail" component={StrengthDetailScreen}/>
       <Stack.Screen name="Shoes"          component={ShoesScreen}/>
+      {/* Workout used to be a tab; in v2.0 it's a stack-pushed screen
+          reached from Plan day starts + Activities ad-hoc picker. */}
+      <Stack.Screen name="Workout"        component={TrackScreen}/>
+      <Stack.Screen name="PresetPlanLibrary" component={PresetPlanLibraryScreen}/>
     </Stack.Navigator>
   );
 }

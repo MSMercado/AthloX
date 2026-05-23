@@ -1505,6 +1505,85 @@ function DraggableDayList({ schedule, colors, onReorder, onDragActive }) {
   );
 }
 
+// ── Plan Hub (v2.0 inactive-state landing) ──────────────────────────────────
+// Shown when the user either has no plan yet OR has finished one and hasn't
+// started another. Four cards (Runna-style):
+//   1. Start new plan       → preset library
+//   2. Restart current plan → reset startDate (hidden if no plan)
+//   3. Continue plan        → only meaningful while mid-plan; shown but
+//                             explains that the plan has ended
+//   4. Generate Custom Plan → existing CreatePlanModal
+//
+// Active users skip this entirely and land on the week schedule below.
+
+function PlanHubView({
+  firstName, hasPlan, workoutPlan,
+  onStartNewPlan, onRestartCurrentPlan, onContinuePlan, onGenerateCustomPlan,
+  colors,
+}) {
+  const styles = makeStyles(colors);
+  const subtitleText = hasPlan
+    ? "You've finished this plan — pick what's next."
+    : "Let's set up your first plan and get you moving.";
+
+  // Hide Restart + Continue when there's no plan to restart/continue.
+  const showRestart  = hasPlan;
+  const showContinue = hasPlan;
+
+  return (
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]} edges={['top']}>
+      <View style={styles.hubHeader}>
+        <HeaderActions />
+        <Text style={[styles.hubTitle, { color: colors.text }]}>Your Plan</Text>
+        <View style={{ width: 60 }} />
+      </View>
+
+      <ScrollView contentContainerStyle={{ padding: 18, paddingBottom: 32 }} showsVerticalScrollIndicator={false}>
+        <View style={{ alignItems: 'center', marginTop: 28, marginBottom: 18 }}>
+          <Text style={{ fontSize: 56 }}>👋</Text>
+        </View>
+        <Text style={[styles.hubGreeting, { color: colors.text }]}>
+          {hasPlan ? `Welcome back, ${firstName}!` : `Welcome, ${firstName}!`}
+        </Text>
+        <Text style={[styles.hubSub, { color: colors.text2 }]}>{subtitleText}</Text>
+
+        <View style={{ height: 18 }} />
+
+        <HubCard label="Start new plan"        sub="Pick from our curated library"  onPress={onStartNewPlan}        colors={colors} />
+        {showRestart  && <HubCard label="Restart current plan" sub={`Re-do "${workoutPlan?.planName || 'your plan'}" from week 1`} onPress={onRestartCurrentPlan} colors={colors} />}
+        {showContinue && <HubCard label="Continue plan"        sub="Pick up where you left off"        onPress={onContinuePlan}        colors={colors} />}
+        <HubCard label="Generate Custom Plan"  sub="AI-built around your goals + gear" onPress={onGenerateCustomPlan} colors={colors} />
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function HubCard({ label, sub, onPress, colors }) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.85}
+      style={{
+        backgroundColor: colors.surface,
+        borderColor:     colors.border,
+        borderWidth:     1,
+        borderRadius:    16,
+        paddingVertical: 22,
+        paddingHorizontal: 20,
+        marginBottom:    12,
+        flexDirection:   'row',
+        alignItems:      'center',
+      }}
+    >
+      <View style={{ flex: 1 }}>
+        <Text style={{ color: colors.text, fontSize: 17, fontWeight: '800' }}>{label}</Text>
+        <Text style={{ color: colors.text3, fontSize: 13, marginTop: 4 }}>{sub}</Text>
+      </View>
+      <Text style={{ color: colors.text3, fontSize: 22 }}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
 // ── Main Screen ───────────────────────────────────────────────────────────────
 
 export default function PlanScreen() {
@@ -1540,6 +1619,12 @@ export default function PlanScreen() {
 
   const hasCoachSchedule = scheduledWorkouts?.length > 0;
   const hasPlan          = !!workoutPlan;
+
+  // v2.0 — "active" means the user has a plan AND hasn't finished it yet.
+  // Inactive users (no plan, or plan completed) land on the 4-card hub
+  // instead of an empty / over-the-line week schedule.
+  const planActive = hasPlan && currentWeekNum <= totalWeeks;
+  const showHub    = !planActive;
 
   const openWorkout = (dayData, dayDate, weekNum) => setDetailWorkout({ dayData, dayDate, weekNum });
   const closeDetail = () => setDetailWorkout(null);
@@ -1673,6 +1758,50 @@ export default function PlanScreen() {
       ]
     );
   };
+
+  // v2.0 — when the user has no active plan, render the 4-card hub instead
+  // of the week schedule. Active users still get the existing UI.
+  if (showHub) {
+    return (
+      <>
+        <PlanHubView
+          firstName={firstName}
+          hasPlan={hasPlan}
+          workoutPlan={workoutPlan}
+          onStartNewPlan={() => navigation.navigate('PresetPlanLibrary')}
+          onRestartCurrentPlan={() => {
+            if (!workoutPlan) return;
+            Alert.alert(
+              'Restart this plan?',
+              `Your week 1 will start today. Past completion marks stay on your history.`,
+              [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Restart', onPress: () => setWorkoutPlan({ ...workoutPlan, startDate: new Date().toISOString() }) },
+              ]
+            );
+          }}
+          onContinuePlan={() => {
+            // Plan is finished; "Continue" only makes sense after a Restart.
+            // We surface the same restart confirm so users don't dead-end.
+            if (workoutPlan) {
+              Alert.alert(
+                "You've finished this plan",
+                'Tap Restart to begin it again from week 1, or pick a new one.',
+                [{ text: 'OK' }]
+              );
+            }
+          }}
+          onGenerateCustomPlan={() => setShowCreate(true)}
+          colors={colors}
+        />
+        <CreatePlanModal
+          visible={showCreate}
+          onClose={() => setShowCreate(false)}
+          onCreated={plan => setWorkoutPlan(plan)}
+        />
+      </>
+    );
+  }
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.bg }]} edges={['top']}>
@@ -1878,6 +2007,11 @@ export default function PlanScreen() {
 
 const makeStyles = (colors) => StyleSheet.create({
   container:      { flex: 1, backgroundColor: colors.bg },
+  // v2.0 Plan Hub styles
+  hubHeader:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 8, paddingBottom: 12 },
+  hubTitle:       { fontSize: 17, fontWeight: '800' },
+  hubGreeting:    { fontSize: 26, fontWeight: '900', textAlign: 'center' },
+  hubSub:         { fontSize: 15, textAlign: 'center', marginTop: 8, paddingHorizontal: 12 },
   scroll:         { paddingHorizontal: 16, paddingBottom: 40 },
 
   header:         { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', paddingTop: 20, paddingBottom: 16 },
