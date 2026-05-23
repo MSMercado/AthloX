@@ -155,6 +155,14 @@ export async function updateRunActivity(id, patch) {
   if (patch.elevationGainM !== undefined)   dbPatch.elevation_gain_m   = patch.elevationGainM;
   if (patch.calories !== undefined)         dbPatch.calories           = patch.calories;
   if (patch.splits !== undefined)           dbPatch.splits             = patch.splits;
+  // v2.0 detail-screen patchable columns
+  if (patch.notes !== undefined)            dbPatch.notes              = patch.notes;
+  if (patch.location !== undefined)         dbPatch.location           = patch.location;
+  if (patch.prescribed !== undefined)       dbPatch.prescribed         = patch.prescribed;
+  if (patch.shoesId !== undefined)          dbPatch.shoes_id           = patch.shoesId;
+  if (patch.avgHrBpm !== undefined)         dbPatch.avg_hr_bpm         = patch.avgHrBpm;
+  if (patch.maxHrBpm !== undefined)         dbPatch.max_hr_bpm         = patch.maxHrBpm;
+  if (patch.avgCadence !== undefined)       dbPatch.avg_cadence        = patch.avgCadence;
   const { data, error } = await supabase
     .from(TABLE)
     .update(dbPatch)

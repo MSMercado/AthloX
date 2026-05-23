@@ -90,6 +90,7 @@ function SettingsModal({ visible, onClose, user, onLogout, loggingOut, onDeleteA
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const { darkMode, toggleDarkMode, notifSettings, setNotifSettings } = useStore();
+  const navigation = useNavigation();
 
   const meta      = user?.user_metadata || {};
   const level     = meta.level     || 'Beginner';
@@ -207,6 +208,17 @@ function SettingsModal({ visible, onClose, user, onLogout, loggingOut, onDeleteA
               icon="✨"
               label="Weekly coach tip (Mondays)"
               right={<Switch value={notifSettings?.coach ?? false} onValueChange={v => toggleNotif('coach', v)} trackColor={{ true: colors.accent }} thumbColor="#fff" />}
+              noBorder
+            />
+          </View>
+
+          {/* v2.0 — Shoes manager */}
+          <Text style={styles.settingGroupLabel}>Gear</Text>
+          <View style={styles.settingCard}>
+            <SettingRow
+              icon="👟"
+              label="Shoes"
+              onPress={() => { onClose(); navigation.navigate('Shoes'); }}
               noBorder
             />
           </View>

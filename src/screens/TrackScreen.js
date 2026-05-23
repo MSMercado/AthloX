@@ -35,6 +35,9 @@ import { supabase } from '../lib/supabase';
 import { shareWorkout } from '../lib/community';
 import { updateWorkoutNotification, clearWorkoutNotification } from '../lib/workoutNotification';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { saveStrengthSession, enqueuePendingStrength } from '../lib/strengthSessions';
+import { readRunMetrics, requestPermissions as requestHcPermissions } from '../lib/healthConnect';
+import { updateRunActivity } from '../lib/runActivities';
 
 const { width } = Dimensions.get('window');
 
@@ -676,7 +679,7 @@ export default function TrackScreen({ route }) {
         ...(prescribedRef.current ? { prescribed: prescribedRef.current } : {}),
       };
       saveRunActivity(activity)
-        .then(saved => {
+        .then(async saved => {
           // Stitch the run_activities row id back onto the local log entry so
           // taps from Today's "Recent Activity" can re-open the rich summary.
           const updatedLogs = useStore.getState().logs.map(l =>
@@ -687,6 +690,18 @@ export default function TrackScreen({ route }) {
           import('@react-native-async-storage/async-storage').then(({ default: AS }) =>
             AS.setItem('wb_logs', JSON.stringify(updatedLogs)).catch(() => {})
           );
+
+          // v2.0 — best-effort: backfill HR + cadence from Health Connect.
+          // No-op on iOS, on JS-only dev builds, and when no wearable data
+          // exists for the run window. Doesn't block navigation to summary.
+          (async () => {
+            try {
+              await requestHcPermissions();
+              const metrics = await readRunMetrics(startedAt, new Date().toISOString());
+              if (metrics) await updateRunActivity(saved.id, metrics);
+            } catch { /* silent */ }
+          })();
+
           // Navigate to the rich summary screen (drops the basic gps-done screen).
           navigation.navigate('RunSummary', { activityId: saved.id });
         })
@@ -705,12 +720,50 @@ export default function TrackScreen({ route }) {
     clearInterval(timerRef.current);
     setMode('str-done');
     const isFirst = logs.length === 0;
-    addLog({ id: Date.now(), date: todayStr(), ts: Date.now(), routine: selR?.name || 'Workout', duration: Math.round(elapsed / 60), calories: strCal, type: 'strength' });
+    const logId = Date.now();
+    addLog({ id: logId, date: todayStr(), ts: Date.now(), routine: selR?.name || 'Workout', duration: Math.round(elapsed / 60), calories: strCal, type: 'strength' });
     // Effort-based XP: scales with sets completed, requires >= 1 min + 25% of sets.
     // Stopping after 1 second awards 0 XP. Half-finished workout awards half XP.
     let xp = computeStrengthXP(doneSets, totalSets, elapsed);
     if (xp > 0 && isFirst) xp += XP_REWARDS.FIRST_WORKOUT;
     if (xp > 0) addXP(xp);
+
+    // v2.0 — persist per-exercise detail to strength_sessions so the
+    // Activities tab can open a real detail screen instead of an Alert.
+    // Each prescribed set becomes one entry in the `sets` jsonb array;
+    // checked = completed === true, unchecked = false. Fire-and-forget;
+    // any failure falls back to the AsyncStorage offline queue.
+    const startedAt = new Date(Date.now() - elapsed * 1000).toISOString();
+    const exercisesPayload = (exs || []).map((ex, i) => {
+      const planSetCount = typeof ex.sets === 'number' ? ex.sets : 3;
+      const setsArr = Array.from({ length: planSetCount }, (_, n) => ({
+        reps:      ex.reps   ?? null,
+        weight:    ex.weight ?? null,
+        completed: !!sets[`${ex.id}-${n}`],
+      }));
+      return { ordinal: i, name: ex.name || `Exercise ${i + 1}`, sets: setsArr };
+    });
+    const sessionPayload = {
+      logId,
+      startedAt,
+      durationSec: elapsed,
+      calories:    strCal,
+      routineName: selR?.name || 'Workout',
+    };
+    saveStrengthSession(sessionPayload, exercisesPayload)
+      .then(saved => {
+        const updatedLogs = useStore.getState().logs.map(l =>
+          l.id === logId ? { ...l, strengthSessionId: saved.id } : l
+        );
+        useStore.setState({ logs: updatedLogs });
+        import('@react-native-async-storage/async-storage').then(({ default: AS }) =>
+          AS.setItem('wb_logs', JSON.stringify(updatedLogs)).catch(() => {})
+        );
+      })
+      .catch(err => {
+        console.warn('[TrackScreen] saveStrengthSession failed, queuing:', err?.message);
+        enqueuePendingStrength({ session: sessionPayload, exercises: exercisesPayload });
+      });
   };
 
   /* ══════════════════════════════════════════════════════════════

@@ -52,6 +52,7 @@ import {
   deleteRunActivity,
   listRunActivities,
 } from '../lib/runActivities';
+import { listShoes } from '../lib/shoes';
 
 // v2.0 — PR milestones (km only). Same list as PerformanceTab's hexagon grid;
 // kept in sync manually for now (refactor to a shared module if it drifts).
@@ -454,6 +455,8 @@ export default function RunSummaryScreen() {
   const [noteDraft,     setNoteDraft]     = useState('');
   const [savingNote,    setSavingNote]    = useState(false);
   const [lifetimePRs,   setLifetimePRs]   = useState({});   // id → bestSec across other runs
+  const [shoes,         setShoes]         = useState([]);    // user's active shoes
+  const [shoesPickerOpen, setShoesPickerOpen] = useState(false);
 
   // Load the activity by id
   useEffect(() => {
@@ -551,6 +554,30 @@ export default function RunSummaryScreen() {
 
   // Per-minute laps.
   const laps = useMemo(() => computeLaps(activity?.path), [activity]);
+
+  // v2.0 — load the user's active shoes for the per-run selector.
+  useEffect(() => {
+    let cancelled = false;
+    listShoes({ includeRetired: false })
+      .then(list => { if (!cancelled) setShoes(list || []); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [activity?.id]);
+
+  const selectedShoe = useMemo(() => {
+    if (!activity?.shoesId) return null;
+    return shoes.find(s => s.id === activity.shoesId) || null;
+  }, [activity?.shoesId, shoes]);
+
+  const handlePickShoe = async (shoeId) => {
+    setShoesPickerOpen(false);
+    try {
+      const updated = await updateRunActivity(activity.id, { shoesId });
+      setActivity(updated);
+    } catch (e) {
+      Alert.alert('Could not update shoes', e?.message || 'Try again');
+    }
+  };
 
   // v2.0 — save the notes draft to Supabase.
   const handleSaveNote = async () => {
@@ -711,6 +738,25 @@ export default function RunSummaryScreen() {
               <Text style={styles.secondaryStatLabel}>Calories</Text>
             </View>
           </View>
+          {/* v2.0 — HR + cadence row (from Health Connect). Only renders when
+              at least one value exists, so testers without wearables don't see
+              empty boxes. */}
+          {(activity.avgHrBpm != null || activity.maxHrBpm != null || activity.avgCadence != null) && (
+            <View style={[styles.secondaryGrid, { marginTop: 10 }]}>
+              <View style={styles.secondaryStat}>
+                <Text style={styles.secondaryStatValue}>{activity.avgHrBpm ?? '—'}{activity.avgHrBpm != null ? ' bpm' : ''}</Text>
+                <Text style={styles.secondaryStatLabel}>Avg HR</Text>
+              </View>
+              <View style={styles.secondaryStat}>
+                <Text style={styles.secondaryStatValue}>{activity.maxHrBpm ?? '—'}{activity.maxHrBpm != null ? ' bpm' : ''}</Text>
+                <Text style={styles.secondaryStatLabel}>Max HR</Text>
+              </View>
+              <View style={styles.secondaryStat}>
+                <Text style={styles.secondaryStatValue}>{activity.avgCadence ?? '—'}{activity.avgCadence != null ? ' spm' : ''}</Text>
+                <Text style={styles.secondaryStatLabel}>Cadence</Text>
+              </View>
+            </View>
+          )}
         </View>
 
         {/* v2.0 — Best Efforts (in-activity PR hexagons) */}
@@ -785,6 +831,31 @@ export default function RunSummaryScreen() {
           </View>
         ) : null}
 
+        {/* v2.0 — Shoes selector */}
+        <View style={styles.section}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <Text style={styles.sectionLabel}>Shoes</Text>
+            <TouchableOpacity onPress={() => setShoesPickerOpen(true)} activeOpacity={0.7}>
+              <Text style={{ color: accentCol, fontSize: 13, fontWeight: '700' }}>
+                {selectedShoe ? 'Change' : '+ Add shoes'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {selectedShoe ? (
+            <View style={[styles.descBox, { borderColor: accentCol + '33', flexDirection: 'row', alignItems: 'center' }]}>
+              <Text style={{ fontSize: 22, marginRight: 12 }}>👟</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: '#fff', fontWeight: '800', fontSize: 15 }}>{selectedShoe.name}</Text>
+                {(selectedShoe.brand || selectedShoe.model) ? (
+                  <Text style={{ color: '#888', fontSize: 12, marginTop: 2 }}>
+                    {[selectedShoe.brand, selectedShoe.model].filter(Boolean).join(' · ')}
+                  </Text>
+                ) : null}
+              </View>
+            </View>
+          ) : null}
+        </View>
+
         {/* v2.0 — Private notes */}
         <View style={styles.section}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
@@ -822,6 +893,54 @@ export default function RunSummaryScreen() {
           </View>
         </View>
       </ScrollView>
+
+      {/* v2.0 — Shoes picker modal */}
+      <Modal visible={shoesPickerOpen} animationType="fade" transparent onRequestClose={() => setShoesPickerOpen(false)}>
+        <TouchableOpacity activeOpacity={1} onPress={() => setShoesPickerOpen(false)} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' }}>
+          <TouchableOpacity activeOpacity={1} onPress={() => {}} style={{ backgroundColor: '#111', borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 20, paddingBottom: 32, maxHeight: '60%' }}>
+            <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: '#333', alignSelf: 'center', marginBottom: 14 }} />
+            <Text style={{ color: '#fff', fontSize: 17, fontWeight: '800', textAlign: 'center', marginBottom: 12 }}>Pick shoes</Text>
+            {shoes.length === 0 ? (
+              <Text style={{ color: '#888', textAlign: 'center', padding: 24 }}>
+                You don't have any shoes yet. Add a pair in Profile → Settings → Shoes.
+              </Text>
+            ) : (
+              <ScrollView style={{ maxHeight: 320 }}>
+                <TouchableOpacity
+                  onPress={() => handlePickShoe(null)}
+                  activeOpacity={0.7}
+                  style={{ padding: 14, borderBottomWidth: 1, borderBottomColor: '#222', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}
+                >
+                  <Text style={{ color: !activity.shoesId ? accentCol : '#888', fontSize: 15, fontWeight: '700' }}>No shoes</Text>
+                  {!activity.shoesId && <Text style={{ color: accentCol, fontSize: 18 }}>✓</Text>}
+                </TouchableOpacity>
+                {shoes.map(s => {
+                  const isSel = s.id === activity.shoesId;
+                  return (
+                    <TouchableOpacity
+                      key={s.id}
+                      onPress={() => handlePickShoe(s.id)}
+                      activeOpacity={0.7}
+                      style={{ padding: 14, borderBottomWidth: 1, borderBottomColor: '#222', flexDirection: 'row', alignItems: 'center' }}
+                    >
+                      <Text style={{ fontSize: 22, marginRight: 12 }}>👟</Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: isSel ? accentCol : '#fff', fontSize: 15, fontWeight: isSel ? '800' : '700' }}>{s.name}</Text>
+                        {(s.brand || s.model) ? (
+                          <Text style={{ color: '#888', fontSize: 12, marginTop: 2 }}>
+                            {[s.brand, s.model].filter(Boolean).join(' · ')}
+                          </Text>
+                        ) : null}
+                      </View>
+                      {isSel && <Text style={{ color: accentCol, fontSize: 18 }}>✓</Text>}
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
 
       {/* v2.0 — Notes editor modal */}
       <Modal visible={editingNote} animationType="fade" transparent onRequestClose={() => !savingNote && setEditingNote(false)}>

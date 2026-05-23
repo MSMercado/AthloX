@@ -15,6 +15,8 @@ import CoachScreen      from '../screens/CoachScreen';
 import RunSummaryScreen from '../screens/RunSummaryScreen';
 import CircuitTimerScreen from '../screens/CircuitTimerScreen';
 import ActivitiesScreen   from '../screens/ActivitiesScreen';
+import StrengthDetailScreen from '../screens/StrengthDetailScreen';
+import ShoesScreen           from '../screens/ShoesScreen';
 
 const Tab   = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -101,6 +103,8 @@ export default function AppNavigator() {
       <Stack.Screen name="Progress"    component={ProgressScreen}  />
       <Stack.Screen name="RunSummary"   component={RunSummaryScreen}/>
       <Stack.Screen name="CircuitTimer" component={CircuitTimerScreen}/>
+      <Stack.Screen name="StrengthDetail" component={StrengthDetailScreen}/>
+      <Stack.Screen name="Shoes"          component={ShoesScreen}/>
     </Stack.Navigator>
   );
 }

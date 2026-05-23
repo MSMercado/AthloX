@@ -115,7 +115,9 @@ function mergeFeed(logs, runs) {
       distanceKm:   log.distance != null ? Number(log.distance) : (runMatch?.distanceKm ?? null),
       paceMinPerKm: runMatch?.avgPaceMinPerKm ?? null,
       calories:     log.calories ?? runMatch?.calories ?? null,
-      runActivityId: log.runActivityId || runMatch?.id || null,
+      runActivityId:      log.runActivityId      || runMatch?.id || null,
+      // v2.0 — strength sessions persist per-exercise detail too.
+      strengthSessionId:  log.strengthSessionId  || null,
       raw:          log,
     });
   }
@@ -228,7 +230,12 @@ export default function WorkoutsTab() {
       navigation.navigate('RunSummary', { activityId: item.runActivityId });
       return;
     }
-    // Strength / circuit / pre-Supabase activity → quick details Alert
+    // v2.0 — strength sessions with persisted detail go to StrengthDetail.
+    if (item.strengthSessionId) {
+      navigation.navigate('StrengthDetail', { sessionId: item.strengthSessionId });
+      return;
+    }
+    // Pre-v2.0 strength logs (no session id) fall back to the quick Alert.
     const lines = [];
     if (item.durationSec) lines.push(`Time: ${fmtTime(item.durationSec)}`);
     if (item.distanceKm)  lines.push(`Distance: ${item.distanceKm.toFixed(2)} km`);

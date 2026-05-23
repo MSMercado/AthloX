@@ -71,7 +71,8 @@
           "photosPermission": "AthloX needs access to your photos to share them in posts and update your profile picture.",
           "cameraPermission": "AthloX needs camera access to take photos for your posts."
         }
-      ]
+      ],
+      "react-native-health-connect"
     ],
     "web": {
       "favicon": "./assets/favicon.png"
