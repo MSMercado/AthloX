@@ -354,6 +354,30 @@ export default function ProfileScreen() {
 
   const levelStyle = LEVEL_COLORS[level] || LEVEL_COLORS.Beginner;
 
+  // v1.4.0 — social counters on the user's own profile. Three head-only
+  // count queries (no row payload), refreshed when user.id changes. Matches
+  // the layout used by SocialScreen.UserProfile for other-user profiles so
+  // the two screens feel like the same thing.
+  const [socialStats, setSocialStats] = useState({ posts: 0, followers: 0, following: 0 });
+  useEffect(() => {
+    if (!user?.id) return;
+    let cancelled = false;
+    (async () => {
+      const [postsRes, followersRes, followingRes] = await Promise.all([
+        supabase.from('posts')   .select('id', { count: 'exact', head: true }).eq('user_id',      user.id),
+        supabase.from('follows') .select('id', { count: 'exact', head: true }).eq('following_id', user.id),
+        supabase.from('follows') .select('id', { count: 'exact', head: true }).eq('follower_id',  user.id),
+      ]);
+      if (cancelled) return;
+      setSocialStats({
+        posts:     postsRes.count     || 0,
+        followers: followersRes.count || 0,
+        following: followingRes.count || 0,
+      });
+    })().catch(() => { /* silent — stats degrade to 0 on transient failure */ });
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
   const handleSave = async () => {
     if (!name.trim()) { Alert.alert('Name cannot be empty'); return; }
     setSaving(true);
@@ -529,11 +553,12 @@ export default function ProfileScreen() {
                 </TouchableOpacity>
               )}
               {meta.bio ? <Text style={styles.bio}>{meta.bio}</Text> : null}
-              <View style={[styles.levelBadge, { backgroundColor: levelStyle.bg }]}>
-                <Text style={[styles.levelText, { color: levelStyle.text }]}>{level}</Text>
-              </View>
+              {/* Experience level (beginner/intermediate/advanced) removed
+                  v1.4.0 — was redundant with the gamified XP level below.
+                  Tester feedback: it felt clinical + dated. Fitness level
+                  still lives on the Settings row for reference. */}
 
-              {/* XP Level Bar */}
+              {/* XP Level Bar — the public, gamified level (Noob, Rookie, …) */}
               <View style={[styles.xpCard, { backgroundColor: colors.bg, borderColor: colors.border }]}>
                 <View style={styles.xpCardHeader}>
                   <Text style={styles.xpCardEmoji}>{levelInfo.current.emoji}</Text>
@@ -565,13 +590,23 @@ export default function ProfileScreen() {
           )}
         </View>
 
-        {/* Stats */}
+        {/* Fitness stats */}
         <View style={styles.statsRow}>
           <StatPill value={logs.length} label="Workouts" styles={styles} />
           <View style={styles.statDivider} />
           <StatPill value={streak} label="Day Streak" styles={styles} />
           <View style={styles.statDivider} />
           <StatPill value={goals.length} label="Goals" styles={styles} />
+        </View>
+
+        {/* Social stats (v1.4.0) — Posts / Followers / Following.
+            Mirrors the other-user profile layout in SocialScreen. */}
+        <View style={[styles.statsRow, { marginTop: 10 }]}>
+          <StatPill value={socialStats.posts}     label="Posts"     styles={styles} />
+          <View style={styles.statDivider} />
+          <StatPill value={socialStats.followers} label="Followers" styles={styles} />
+          <View style={styles.statDivider} />
+          <StatPill value={socialStats.following} label="Following" styles={styles} />
         </View>
 
         {/* Goals */}

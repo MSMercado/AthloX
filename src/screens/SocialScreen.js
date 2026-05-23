@@ -88,9 +88,10 @@ function UserProfile({ userId, myUserId, onBack }) {
             {profile.username ? (
               <Text style={styles.profileHandle}>@{profile.username}</Text>
             ) : null}
-            {profile.level ? (
-              <View style={styles.levelBadge}><Text style={styles.levelText}>{profile.level}</Text></View>
-            ) : null}
+            {/* Experience level (Beginner/Intermediate/Advanced) removed
+                v1.4.0 for consistency with own-profile change. Other-user XP
+                level isn't shareable yet — re-add a gamified pill here once
+                profiles.xp / a public-XP view exists. */}
             {profile.streak > 0 && (
               <Text style={styles.profileBio}>🔥 {profile.streak} day streak</Text>
             )}

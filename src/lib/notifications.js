@@ -22,6 +22,15 @@ export const NOTIF_IDS = {
   COACH_TIP:         'athlox_coach_tip',
 };
 
+// Per-day plan reminder ids share this prefix so we can find + cancel them
+// without tracking individual ids ourselves.
+const PLAN_WORKOUT_PREFIX = 'athlox_plan_workout_';
+const PLAN_REMINDER_HOUR   = 7;
+const PLAN_REMINDER_MINUTE = 30;
+// How many days ahead we schedule. iOS caps scheduled local notifications at
+// 64 total — 7 days is well under that and PlanScreen reschedules on focus.
+const PLAN_HORIZON_DAYS = 7;
+
 // ── Request Permission ────────────────────────────────────────────────────────
 export async function requestNotificationPermission() {
   const { status: existing } = await Notifications.getPermissionsAsync();
@@ -108,6 +117,68 @@ export async function scheduleCoachTip(enabled = true) {
   });
 }
 
+// ── Per-day plan workout reminders (v1.4.0) ──────────────────────────────────
+// Schedules a one-shot notification for the morning of each non-rest day in
+// the user's active plan, over the next PLAN_HORIZON_DAYS. Re-callable
+// (cancels prior plan notifs before re-scheduling) so PlanScreen can wire it
+// to the plan + planCompletions state and re-run on focus.
+//
+// Each notification's body is the day's focus (e.g. "Push — chest,
+// shoulders, triceps") so the user knows what they're showing up for
+// without having to open the app.
+export async function schedulePlanWorkoutReminders(plan, planCompletions = {}) {
+  // Cancel any prior plan-day reminders by walking the scheduled list and
+  // matching the prefix. Cheaper than tracking ids ourselves.
+  try {
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    await Promise.all(
+      (scheduled || [])
+        .filter(n => (n.identifier || '').startsWith(PLAN_WORKOUT_PREFIX))
+        .map(n => Notifications.cancelScheduledNotificationAsync(n.identifier).catch(() => {}))
+    );
+  } catch { /* silent — best-effort cancellation */ }
+
+  if (!plan || !Array.isArray(plan.weeklySchedule) || plan.weeklySchedule.length === 0) return;
+
+  const granted = await requestNotificationPermission();
+  if (!granted) return;
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+
+  for (let i = 0; i < PLAN_HORIZON_DAYS; i++) {
+    const day = new Date(today); day.setDate(today.getDate() + i);
+    // weeklySchedule is stored Mon-Sun. JS getDay() is Sun=0..Sat=6, so the
+    // Mon-Sun index is (dow + 6) % 7.
+    const dow = day.getDay();
+    const idx = (dow + 6) % 7;
+    const slot = plan.weeklySchedule[idx];
+    if (!slot || slot.type === 'rest') continue;
+
+    const yyyy = day.getFullYear();
+    const mm   = String(day.getMonth() + 1).padStart(2, '0');
+    const dd   = String(day.getDate()).padStart(2, '0');
+    const dateKey = `${yyyy}-${mm}-${dd}`;
+    if (planCompletions[dateKey]) continue; // already marked done
+
+    const trigger = new Date(day);
+    trigger.setHours(PLAN_REMINDER_HOUR, PLAN_REMINDER_MINUTE, 0, 0);
+    if (trigger.getTime() <= Date.now()) continue; // past — skip
+
+    const body = slot.focus || (slot.type === 'run' ? 'Run day' : 'Workout day');
+
+    await Notifications.scheduleNotificationAsync({
+      identifier: PLAN_WORKOUT_PREFIX + dateKey,
+      content: {
+        title: "Today's workout 💪",
+        body,
+        sound: true,
+        data:  { screen: 'Plan' },
+      },
+      trigger: { date: trigger },
+    }).catch(() => { /* skip this day if scheduling fails */ });
+  }
+}
+
 // ── Cancel all AthloX notifications ──────────────────────────────────────────
 export async function cancelAllNotifications() {
   await Promise.all(
@@ -115,6 +186,15 @@ export async function cancelAllNotifications() {
       Notifications.cancelScheduledNotificationAsync(id).catch(() => {})
     )
   );
+  // Also walk the scheduled list to catch the dynamic per-day plan reminders.
+  try {
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    await Promise.all(
+      (scheduled || [])
+        .filter(n => (n.identifier || '').startsWith(PLAN_WORKOUT_PREFIX))
+        .map(n => Notifications.cancelScheduledNotificationAsync(n.identifier).catch(() => {}))
+    );
+  } catch { /* silent */ }
 }
 
 // ── Apply all notification settings at once ───────────────────────────────────

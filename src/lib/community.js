@@ -44,10 +44,13 @@ export async function ensureProfileComplete(user) {
   if (!existing) {
     // No profile row at all — create one with everything we know
     const username = await pickAvailableDefault(user.email, user.id);
+    // Note: do NOT include `email` here — the column doesn't exist on
+    // `profiles`. Email lives in `auth.users` and is joined when needed.
+    // Including it caused silent insert failures (Postgres rejects unknown
+    // columns) which v1.2.1 worked around but never fixed at source.
     await supabase.from('profiles').upsert({
       id:       user.id,
       name:     fallbackName,
-      email:    user.email,
       level:    meta.level || null,
       username,
     });

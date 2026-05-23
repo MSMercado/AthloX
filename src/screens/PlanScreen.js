@@ -4,7 +4,7 @@ import {
   StyleSheet, Modal, ActivityIndicator, Alert, BackHandler,
   Animated, PanResponder,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import useStore from '../store/useStore';
 import useColors from '../lib/useColors';
@@ -15,6 +15,7 @@ import { TUTORIALS } from '../data/exerciseTutorials';
 import { supabase } from '../lib/supabase';
 import { generatePlan } from '../lib/planGenerator';
 import { goalHasAnyScaffold } from '../data/planScaffolds';
+import { schedulePlanWorkoutReminders } from '../lib/notifications';
 
 // Name-based tutorial lookup — plan exercises from AI have names but no numeric IDs.
 // LLM-generated names often add modifiers ("Barbell Bench Press", "Dumbbell Shoulder Press",
@@ -110,49 +111,6 @@ const DAYS_PER_WEEK = [
 
 const DAY_ORDER = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
-// ── LLM JSON Sanitizer ────────────────────────────────────────────────────────
-// LLMs occasionally sometimes return JSON with raw U+0000..U+001F
-// control characters inside string values (e.g. a literal newline in a
-// "coachNote"). Strict JSON.parse throws "U+0000 thru U+001F is not allowed
-// in string". This walks the text once, detects when we're inside a string
-// literal, and escapes any stray control chars it finds. Structural whitespace
-// (newlines/tabs between tokens) is preserved.
-function sanitizeLlmJson(s) {
-  let out = '';
-  let inString = false;
-  let escape = false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    const code = c.charCodeAt(0);
-    if (escape) {
-      out += c;
-      escape = false;
-      continue;
-    }
-    if (c === '\\' && inString) {
-      out += c;
-      escape = true;
-      continue;
-    }
-    if (c === '"') {
-      inString = !inString;
-      out += c;
-      continue;
-    }
-    if (inString && code < 0x20) {
-      if (c === '\n')      out += '\\n';
-      else if (c === '\r') out += '\\r';
-      else if (c === '\t') out += '\\t';
-      else if (c === '\b') out += '\\b';
-      else if (c === '\f') out += '\\f';
-      else                 out += '\\u' + code.toString(16).padStart(4, '0');
-      continue;
-    }
-    out += c;
-  }
-  return out;
-}
-
 // ── Date Helpers ──────────────────────────────────────────────────────────────
 
 function getMondayOfWeek(date) {
@@ -229,31 +187,10 @@ function findOrderingConflict(schedule) {
   return null;
 }
 
-// Auto-fix leg↔run adjacency by swapping in a rest day. Used when the LLM
-// produces a plan that ignores the sequencing rule (it sometimes does despite
-// the explicit prompt instruction). Bounded to 7 iterations since there are
-// only 7 days. Day labels are reassigned by position after swapping so the
-// schedule stays Mon-Sun in storage.
-function fixOrderingConflicts(schedule) {
-  if (!Array.isArray(schedule) || schedule.length < 2) return schedule;
-  const fixed = schedule.map(d => ({ ...d }));
-  for (let iter = 0; iter < 7; iter++) {
-    const conflict = findOrderingConflict(fixed);
-    if (!conflict) break;
-    const nextIdx = (conflict.idx + 1) % fixed.length;
-    // Find a rest day elsewhere we can swap into nextIdx (pushing the
-    // conflicting day out of harm's way). Skip the conflict positions.
-    let restIdx = -1;
-    for (let i = 0; i < fixed.length; i++) {
-      if (i === conflict.idx || i === nextIdx) continue;
-      if (fixed[i]?.type === 'rest') { restIdx = i; break; }
-    }
-    if (restIdx === -1) break; // no rest available — give up gracefully
-    [fixed[restIdx], fixed[nextIdx]] = [fixed[nextIdx], fixed[restIdx]];
-  }
-  // Re-stamp day labels by position so storage stays Mon-Sun aligned.
-  return fixed.map((d, i) => ({ ...d, day: DAY_ORDER[i] || d.day }));
-}
+// fixOrderingConflicts removed v1.4.0 — only used by the dead callPlanLlm
+// path. The hybrid planGenerator builds schedules from hand-curated scaffolds
+// so leg↔run adjacency is impossible by construction. findOrderingConflict
+// (used by the in-app drag-to-reorder warning) is kept above.
 
 // Local-time YYYY-MM-DD key for the planCompletions store. Using local instead of
 // UTC so a workout marked "today" near midnight stays attached to the user's
@@ -678,6 +615,7 @@ function CreatePlanModal({ visible, onClose, onCreated }) {
   const colors   = useColors();
   const { user } = useStore();
   const styles   = useMemo(() => makeStyles(colors), [colors]);
+  const insets   = useSafeAreaInsets();
 
   const [step, setStep]           = useState(0);
   const [goal, setGoal]           = useState(null);
@@ -711,324 +649,13 @@ function CreatePlanModal({ visible, onClose, onCreated }) {
   })();
   const close = () => { reset(); onClose(); };
 
-  const levelGuidelines = level.toLowerCase().includes('beginner')
-    ? `CRITICAL — this is a BEGINNER. You MUST follow these rules:
-- NO burpees, box jumps, jump squats, or any explosive/plyometric movements
-- NO exercises that require advanced coordination or balance
-- Stick to these beginner-safe movements ONLY: bodyweight squats, lunges, glute bridges, push-ups (full or knee), planks, dead bugs, bird dogs, dumbbell rows, shoulder press with light weight, lat pull-downs, step-ups
-- Sets: 2–3 per exercise. Reps: 10–15. Rest: 90 seconds between sets
-- Keep the plan encouraging — beginners need to build confidence`
-    : level.toLowerCase().includes('intermediate')
-    ? `This is an INTERMEDIATE user:
-- Include compound lifts (squats, deadlifts, bench press, rows) and moderate bodyweight work
-- Sets: 3–4 per exercise. Reps: 8–12. Rest: 60–90 seconds`
-    : `This is an ADVANCED user:
-- Include heavy compound lifts, complex movements, and high-intensity techniques
-- Sets: 4–5. Rep ranges vary (3–6 strength, 8–12 hypertrophy, 15–20 endurance). Rest: 45–60 seconds`;
-
-  const buildPrompt = () => `You are an elite personal trainer. Create a ${duration}-week PHASED workout plan for ${firstName}.
-
-User profile:
-- Fitness level: ${level}
-- Age group: ${ageGroup}
-- Available equipment: ${equipment}
-- Training styles: ${styles_}
-- Existing goals: ${userGoals}
-- Selected plan goal: ${goal}
-- Training days per week: ${daysPerWk}
-- Current capability: ${currentCap?.trim() || 'not specified — assume typical for the fitness level above'}
-
-${levelGuidelines}
-
-CRITICAL — produce a REAL progressive program with WEEK-TO-WEEK variation, not the same week repeated:
-
-1. Split the plan into PHASES that together cover weeks 1 through ${duration} with no gaps and no overlaps. The number of phases scales with the total duration — longer plans require more phases AND more deload weeks scattered throughout, not just one giant phase repeated.
-
-   PHASE COUNT BY DURATION (use this as your guide):
-   - 4-6 weeks: 2-3 phases (e.g. Foundation → Build, with optional 1-week Deload at the end)
-   - 8-12 weeks (≈ 3 months): 3-4 phases, including at least one Deload week (e.g. Foundation → Build → Deload → Peak)
-   - 16-24 weeks (≈ 4-6 months): 4-6 phases with TWO deload weeks scattered through the program — one mid-program (around week 8-10) and one before final Peak (e.g. Foundation → Build 1 → Deload → Build 2 → Deload → Peak)
-   - 36-52 weeks (≈ 9 months to 1 year): 6-9 phases organised as mesocycles. Insert a deload week roughly every 4-5 weeks of hard training. Treat this like multiple complete training blocks back-to-back, each with its own progression arc. Example for a 52-week plan: Foundation → Hypertrophy 1 → Deload → Strength 1 → Deload → Power → Deload → Hypertrophy 2 → Deload → Strength 2 → Deload → Peak → Active Recovery
-   - For very long plans (≥ 6 months), the LATER phases must use noticeably DIFFERENT exercise selections from the earlier phases so the program never feels stale — a year of identical squat variants is worse than a year of varied lower-body work.
-
-   Goal-specific structures (apply within the phase count above):
-   - Strength/hypertrophy: Foundation → Build → Deload → Peak (repeat the cycle for plans ≥ 16 weeks with fresh exercises each cycle)
-   - Running 5K: Base Build → Speed/Tempo → Race Prep → Taper
-   - Running 10K: Base Build → Threshold → Long Run Focus → Taper
-   - Running Half Marathon: Base Build → Tempo & Long Runs → Race Prep → Taper
-   - Running Marathon: Base Build → Long Run Build → Peak Long Runs → Taper
-   - Long-duration running plans (24+ weeks): repeat base-build cycles with a key race / time trial at the end of each, then taper into the final goal race.
-
-2. EACH PHASE has DIFFERENT exercise variants from other phases — phase-to-phase rotation. For example:
-   - Foundation: Bench Press, Back Squat, Conventional Deadlift
-   - Build: Incline DB Press, Front Squat, Romanian Deadlift
-   - Peak: Close-Grip Bench, Pause Squat, Deficit Deadlift
-
-3. WITHIN EACH PHASE, also vary exercises week-to-week so weeks don't feel repetitive. Provide 2-3 \`scheduleVariants\` per phase that the user rotates through. Each variant keeps the SAME muscle-group focus on the same day (Mon = chest/shoulders/triceps, Tue = legs, etc.) but uses DIFFERENT specific exercises AND a DIFFERENT \`focus\` label that reflects what's distinctive about that variant. Example for Foundation phase Monday push session:
-   - Variant A focus: "Push: Bench Strength" — Bench Press, Overhead Press, Tricep Pushdowns, Dips
-   - Variant B focus: "Push: Incline & Volume" — Incline DB Press, DB Shoulder Press, Skullcrushers, Pike Push-ups
-   - Variant C focus: "Push: Close-Grip Focus" — Close-Grip Bench, Arnold Press, Diamond Push-ups, Cable Chest Fly
-   IMPORTANT: every variant on the same weekday MUST have a DIFFERENT \`focus\` string — never repeat "Upper Body Push" across all variants. The focus label is what the user sees on the day card; identical labels make weeks feel the same even when exercises differ. The app alternates variants automatically (Week 1 = A, Week 2 = B, Week 3 = A, etc.). Two variants is the minimum; three is ideal for phases of 4+ weeks.
-
-   For RUNNING days, the same rule applies — vary the focus label too:
-   - Variant A: "Easy Run", Variant B: "Tempo Run", Variant C: "Interval Session"
-   - Or for long-run days: Variant A: "Long Run · 8 km", Variant B: "Long Run · 10 km Progressive"
-
-4. EACH WEEK has a specific concrete progression note — what to DO this week vs last. Be specific:
-   - "Add 5 lbs to all main lifts vs last week"
-   - "Add 1 rep per set if all sets felt RPE ≤ 8"
-   - "Long run: 12 km easy pace"
-   - "DELOAD: drop all loads 30-40%, reduce sets by 1, focus on form"
-
-   MANDATORY: Every week (except Week 1 of a phase) MUST contain at least 2 of these progression mechanics relative to the previous week:
-   - Increase reps (e.g., 10 → 12)
-   - Increase sets (e.g., 3 → 4)
-   - Reduce rest time (e.g., 60s → 45s)
-   - Introduce or extend tempo (e.g., 3-second eccentric)
-   - Add isometric/pause holds (e.g., 2-sec pause at bottom)
-   - Swap an exercise for a harder progression in the same movement pattern
-   Identical workouts across weeks are FORBIDDEN. Even within a single phase, the user must see progression.
-
-5. MOVEMENT-PATTERN VARIATION CHAINS — when picking exercises for variants and across phases, follow disciplined progressions in each pattern. These are concrete chains you should draw from (and extend with similar logic for other patterns):
-
-   Upper Push (chest/shoulders/triceps):
-   DB Floor Press → Incline DB Press → Tempo Bench Press → Alternating DB Press → Close-Grip Bench → Pause Bench
-   Push-up → Wide Push-up → Decline Push-up → Tempo Push-up → Archer Push-up → Diamond Push-up
-
-   Upper Pull (back/biceps):
-   Supported Row → Bent-Over Row → Single-Arm Row → Tempo Row → Chest-Supported Row → Pendlay Row
-   Inverted Row → Banded Pull-up → Negative Pull-up → Pull-up → Chin-up → Weighted Pull-up
-
-   Lower (legs/glutes):
-   Goblet Squat → Tempo Goblet Squat → Pause Goblet Squat → Front Squat → Bulgarian Split Squat → Pause Back Squat
-   Romanian Deadlift → Single-Leg RDL → Tempo RDL → Conventional Deadlift → Deficit Deadlift → Pause Deadlift
-
-   Core:
-   Knee Plank → Plank → Side Plank → Shoulder-Tap Plank → Dead Bug → Hollow Hold → Dragon Flag
-
-   Running:
-   Easy Run (Z2) → Easy + Strides → Tempo Run → Threshold Intervals → VO2 Max Intervals → Long Run with Surges
-
-   Variation must feel INTENTIONAL — pick the next exercise in the same movement family that matches the user's level. Don't randomly swap unrelated movements.
-
-6. PERSONALIZATION VOICE — when writing weekProgressions notes and the coachNote, address the user directly and reference their progression:
-   - "Based on your Foundation phase, your bench should feel ready for +5 lbs this week."
-   - "You're ready to progress from goblet squats to Bulgarian split squats — your single-leg stability is built."
-   - NOT: "The athlete should add weight." (third person, generic)
-
-5. For RUNNING goals, structure phases with progressive long-run distance and a TAPER phase in the final 1-2 weeks. Each variant for a running day can vary the workout TYPE (easy run / tempo / intervals / long run) week-to-week.
-
-6. For STRENGTH/PHYSIQUE goals, include a DELOAD week roughly every 4-5 weeks (between Build and Peak, or as its own short phase).
-
-7. EXERCISE SEQUENCING — NEVER schedule a running day (type "run" or any day with running/cardio focus) on the day immediately AFTER a heavy lower-body / leg day. Running on fatigued legs increases injury risk and undermines both sessions. Always insert at least one rest day or upper-body day between a leg session and a run session. The same applies in reverse: avoid heavy legs the day after a long run.
-
-8. DAY TYPE TAXONOMY — choose the most accurate \`type\` for each day. Use the right format for each:
-   - "strength" — traditional sets × reps (e.g. "Bench Press 3x8 @ 90s rest"). Each exercise has \`sets\` (number) and \`reps\` (string).
-   - "run" — running session. Exercise list typically has 1 entry like { "name": "Easy Run", "duration": "30 min", "pace": "easy" } or { "name": "Long Run", "distance": "12 km", "pace": "easy" }.
-   - "crossfit" — circuit-style. Day MUST include a \`format\` field at the day level (e.g. "AMRAP 12 min", "5 Rounds For Time", "EMOM 10 min", "21-15-9 Chipper"). Exercises in the day list the movements that make up ONE round, with \`reps\` per movement (no \`sets\` — the round count comes from the format). Example exercise: { "name": "Wall Balls", "reps": "15" } or { "name": "Box Jumps", "reps": "12 (24 in/20 in)" }.
-   - "hyrox" — Hyrox-style functional fitness. Day MUST include \`format\` like "Hyrox Workout" or "Compromised Cardio Circuit". Exercises are stations like { "name": "Sled Push", "distance": "20 m", "weight": "moderate" }, { "name": "Farmer Carry", "distance": "100 m", "weight": "2 × 24kg KB" }, { "name": "Burpee Broad Jumps", "reps": "20" }, { "name": "Ski Erg", "distance": "500 m" }, { "name": "Wall Balls", "reps": "30 (9 kg)" }.
-   - "mobility" — short recovery / stretch session. Exercises like { "name": "Hip 90/90", "duration": "2 min/side" }.
-   - "rest" — full rest day, exercises array is empty.
-
-9. PLAN VARIETY — when the user's training styles include "CrossFit" or "Hyrox", or the goal is athletic/general fitness with broad equipment, mix in 1-2 crossfit or hyrox days per week instead of straight strength sessions. Don't make every day strength — variety drives engagement.
-
-10. GOAL-DRIVEN PLAN STRUCTURE — the SELECTED PLAN GOAL dictates the primary modality of the plan. Don't generate a generic strength plan and sprinkle in goal-specific bits. Build the plan around the goal:
-
-    - "Run a 5K" / "Run a 10K" / "Run a Half Marathon" / "Run a Marathon":
-      MOST workout days MUST be type "run" — at least 60-75% of training days. For a ${daysPerWk}-day plan, that means approximately ${Math.max(1, Math.ceil(daysPerWk * 0.7))} of the workout days are running.
-      Running session types must VARY across the week and across phases: easy/Z2 runs, tempo runs, threshold intervals, hill repeats, long runs (key session per week), occasional fartlek or stride sessions. Don't just write "Easy Run" five days in a row.
-      Include AT MOST 1 strength day per week, and that day should be SHORT (30-45 min), focused on runner-supporting work: posterior chain (RDLs, glute bridges, single-leg work), core stability, calf strength. NO marathon-style "leg day" with heavy squats — it'll wreck the next day's run.
-      For shorter distances (5K/10K), bias toward speed and tempo work; for longer (half/marathon), bias toward weekly long runs that progress over time.
-      Phases follow race-prep arc: Base Build → Tempo/Threshold → Race Pace / Peak Long Runs → Taper.
-      ZERO non-running, non-strength days unless the user picks ≥ 6 days/week (then optionally one mobility/cross-training day).
-
-    - "Train CrossFit":
-      MOST workout days should be type "crossfit" with proper formats (AMRAP, EMOM, "X Rounds For Time", chippers like 21-15-9). Include 1 strength day per week for accessory work, 1-2 rest/mobility days, no traditional running days unless the user requested running.
-
-    - "Train for Hyrox":
-      MOST workout days should mix type "hyrox" (station circuits with sled push, farmer carry, wall balls, burpee broad jumps, ski erg, etc.) with type "run" (race-pace intervals + long easy runs — Hyrox is half running). Include 1 strength day per week focused on legs/core. Phases should reflect Hyrox race prep (Base → Threshold → Race Pace → Taper).
-
-    - "Improve Endurance":
-      Mix of running, cycling, or rowing days at varied intensities. Up to 1 strength day per week is fine.
-
-    - For any goal, don't override with generic strength weeks just because the level is Beginner — instead, use SCALED movements for that goal (shorter runs, banded pull-ups instead of muscle-ups, lighter sled, etc.).
-
-Each variant's schedule must include exactly ${daysPerWk} workout days; the remaining days must be type "rest" with empty exercises array (7 entries total Monday-Sunday). Each workout day has 4-6 exercises appropriate for the user's level and equipment. THIS IS NOT OPTIONAL — fewer than 4 exercises per workout day makes the plan feel empty and is the #1 user complaint. Crossfit and Hyrox days must also list 4-6 movements/stations per day.
-
-Respond with ONLY a valid JSON object (no markdown fences):
-
-{
-  "planName": "concise descriptive name",
-  "goal": "${goal}",
-  "durationWeeks": ${duration},
-  "daysPerWeek": ${daysPerWk},
-  "phases": [
-    {
-      "name": "Foundation",
-      "startWeek": 1,
-      "endWeek": 4,
-      "focus": "what this phase builds, 1 short sentence",
-      "scheduleVariants": [
-        {
-          "schedule": [
-            {
-              "day": "Monday",
-              "type": "strength",
-              "focus": "Push: Bench Strength",
-              "exercises": [
-                { "name": "Bench Press",        "sets": 4, "reps": "6-8",  "rest": "120s" },
-                { "name": "Overhead Press",     "sets": 3, "reps": "8-10", "rest": "90s"  },
-                { "name": "Incline DB Press",   "sets": 3, "reps": "10-12","rest": "75s"  },
-                { "name": "Cable Triceps Push", "sets": 3, "reps": "12-15","rest": "60s"  },
-                { "name": "Lateral Raise",      "sets": 3, "reps": "12-15","rest": "60s"  }
-              ]
-            },
-            {
-              "day": "Tuesday",
-              "type": "crossfit",
-              "focus": "AMRAP — Pull & Push",
-              "format": "AMRAP 15 min",
-              "exercises": [
-                { "name": "Pull-ups",       "reps": "8"  },
-                { "name": "Push-ups",       "reps": "12" },
-                { "name": "Air Squats",     "reps": "15" },
-                { "name": "KB Swings",      "reps": "20 (16 kg)" },
-                { "name": "Box Jumps",      "reps": "10 (24 in/20 in)" }
-              ]
-            },
-            { "day": "Wednesday", "type": "rest", "focus": "Rest", "exercises": [] }
-          ]
-        },
-        {
-          "schedule": [
-            {
-              "day": "Monday",
-              "type": "strength",
-              "focus": "Push: Incline & Volume",
-              "exercises": [
-                { "name": "Incline Barbell Press", "sets": 4, "reps": "8-10", "rest": "90s" },
-                { "name": "Dumbbell Bench Press",  "sets": 3, "reps": "10-12","rest": "75s" },
-                { "name": "Cable Fly",             "sets": 3, "reps": "12-15","rest": "60s" },
-                { "name": "Overhead Triceps Ext.", "sets": 3, "reps": "10-12","rest": "60s" },
-                { "name": "Front Raise",           "sets": 3, "reps": "12-15","rest": "60s" }
-              ]
-            },
-            { "day": "Tuesday", "type": "rest", "focus": "Rest", "exercises": [] }
-          ]
-        }
-      ],
-      "weekProgressions": [
-        "Week 1: Light loads (60% RPE). Master form. 3x8 (Variant A).",
-        "Week 2: Slight load increase, fresh exercises. 3x8 (Variant B).",
-        "Week 3: Continue progression, +5 lbs or +1 rep. 3x9 (Variant A).",
-        "Week 4: Final week of Foundation. 3x10 (Variant B)."
-      ],
-      "progressionTagsByWeek": [
-        ["Form focus", "Foundation"],
-        ["New variation", "Same loads"],
-        ["+1 rep", "+5 lbs"],
-        ["+2 reps", "Tempo added"]
-      ]
-    }
-  ],
-  "coachNote": "Motivating personal message to ${firstName}"
-}
-
-ABSOLUTE REQUIREMENTS:
-- phases must collectively cover every week from 1 through ${duration}, with no gaps and no overlaps.
-- For plans ≥ 12 weeks, the program MUST contain at least one explicit Deload phase (1 week, type "deload" or named "Deload") between hard phases.
-- For plans ≥ 24 weeks, the program MUST contain TWO or more deload weeks distributed through the duration (not all clustered at the end).
-- For plans ≥ 36 weeks, exercise selection in the second half of the program must look noticeably DIFFERENT from the first half — different primary lifts, different running structure — so the user is not doing the same workout in week 30 that they did in week 5.
-- EACH phase MUST have a scheduleVariants array with 2-3 entries (not just one).
-- Each variant's schedule has ${daysPerWk} workout days plus rest days (7 entries total Monday-Sunday).
-- Variants on the same weekday MUST use DIFFERENT \`focus\` strings (e.g. "Push: Bench Strength" vs "Push: Incline & Volume", NEVER both labeled "Upper Body Push"). Same muscle group, different focus emphasis.
-- Variants within a phase use DIFFERENT specific exercises.
-- weekProgressions must have exactly (endWeek - startWeek + 1) entries — one per week in that phase.
-- progressionTagsByWeek must also have (endWeek - startWeek + 1) entries — each entry is an array of 2-3 SHORT punchy tags (≤14 chars each) that summarise what changed that week. Examples: "+1 rep", "+5 lbs", "Tempo added", "Less rest", "New variation", "Form focus", "Deload", "Pause added", "Hold +2s". User sees these as small badges in the UI.
-- Exercise variants must DIFFER between phases (phase-to-phase rotation) AND between variants within a phase (week-to-week variety).
-- IDENTICAL WEEKS ARE FORBIDDEN — every week from Week 2 onwards must apply at least 2 progression mechanics from rule #4 vs the previous week. The variant rotation alone is NOT enough; there must be progression in load/reps/sets/tempo/rest too.`;
-
-  // One attempt at calling Groq + parsing JSON. Returns parsed plan or throws.
-  // v1.3.0 will replace this with the hybrid template + LLM personalization
-  // architecture (small prompt fills exercises into pre-built scaffolds).
-  const callPlanLlm = async () => {
-    const isCircuitGoal = /crossfit|hyrox/i.test(goal || '');
-    const maxTokens =
-      duration >= 36         ? 24000 :
-      duration >= 16         ? 16000 :
-      isCircuitGoal          ? 14000 :
-                                10000;
-    const { data, error } = await supabase.functions.invoke('groq-proxy', {
-      body: {
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'user', content: buildPrompt() }],
-        max_tokens: maxTokens,
-        temperature: 0.3,
-        // JSON mode — forces valid JSON output. Eliminates malformed-JSON parse failures.
-        response_format: { type: 'json_object' },
-      },
-    });
-    if (error) throw new Error(error.message || 'Edge function error');
-    if (data?.error) throw new Error(data.error?.message || data.error);
-
-    const raw = data?.choices?.[0]?.message?.content?.trim() || '';
-    if (!raw) throw new Error('Empty response from AI');
-
-    // Strip any stray markdown fences (response_format should prevent them, but be defensive)
-    const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
-    // Escape raw control chars (U+0000..U+001F) inside string literals before strict parse
-    const sanitized = sanitizeLlmJson(cleaned);
-    let plan;
-    try {
-      plan = JSON.parse(sanitized);
-    } catch (parseErr) {
-      // Log the raw response so we can diagnose what the LLM actually produced
-      // (truncation, missing closing brace, etc.). Common on CrossFit / Hyrox
-      // plans where the per-day JSON is denser.
-      console.warn('[plan-gen] JSON parse failed. Response length:', raw.length, 'tail:', raw.slice(-200));
-      throw new Error('Plan response was incomplete — JSON parse failed. Try again, or pick a shorter duration.');
-    }
-
-    // Normalize the plan:
-    //  1. Sort phases by startWeek
-    //  2. Auto-fix leg↔run adjacency in every schedule (LLM doesn't always obey
-    //     the prompt rule on its own)
-    //  3. Backfill the legacy weeklySchedule field from phase 1's first variant
-    if (Array.isArray(plan.phases) && plan.phases.length > 0) {
-      plan.phases.sort((a, b) => (a.startWeek || 1) - (b.startWeek || 1));
-      plan.phases.forEach(phase => {
-        if (Array.isArray(phase.scheduleVariants)) {
-          phase.scheduleVariants.forEach(v => {
-            if (Array.isArray(v?.schedule)) v.schedule = fixOrderingConflicts(v.schedule);
-          });
-        }
-        if (Array.isArray(phase.schedule)) {
-          phase.schedule = fixOrderingConflicts(phase.schedule);
-        }
-      });
-      if (!Array.isArray(plan.weeklySchedule) || plan.weeklySchedule.length === 0) {
-        const p0 = plan.phases[0];
-        plan.weeklySchedule =
-          p0.scheduleVariants?.[0]?.schedule
-          || p0.schedule
-          || [];
-      }
-    } else if (!Array.isArray(plan.weeklySchedule)) {
-      plan.weeklySchedule = [];
-    }
-    // Also fix the top-level weeklySchedule (legacy plans, or our backfill above)
-    if (Array.isArray(plan.weeklySchedule) && plan.weeklySchedule.length > 0) {
-      plan.weeklySchedule = fixOrderingConflicts(plan.weeklySchedule);
-    }
-    return plan;
-  };
 
   const generate = async () => {
     setStep(4);
     let lastErr = null;
-    // v1.3.0 — uses the hybrid template generator. The old callPlanLlm /
-    // buildPrompt path is kept above for reference (and as a fallback while
-    // we expand scaffold coverage) but is no longer the default path.
+    // Hybrid template generator (planGenerator.js). The monolithic LLM
+    // callPlanLlm + buildPrompt was deleted in v1.4.0 (~310 lines of dead
+    // code that hadn't been called since v1.3.0).
     const goalEntry = GOALS.find(g => g.label === goal);
     const goalId    = goalEntry?.id || null;
     const rawEquipment = Array.isArray(meta.equipment) ? meta.equipment : [];
@@ -1065,7 +692,14 @@ ABSOLUTE REQUIREMENTS:
     <Modal visible={visible} animationType="slide" transparent onRequestClose={close}>
       <View style={styles.modalOverlay}>
         <TouchableOpacity style={styles.modalBackdrop} activeOpacity={1} onPress={close} />
-        <View style={[styles.modalSheet, { backgroundColor: colors.surface }]}>
+        <View style={[
+          styles.modalSheet,
+          { backgroundColor: colors.surface,
+            // Replace the fixed 40px bottom padding with the device's actual
+            // bottom inset so the Next/Generate buttons clear the gesture
+            // nav bar on all phones.
+            paddingBottom: Math.max(20, insets.bottom + 12) },
+        ]}>
           <View style={[styles.modalHandle, { backgroundColor: colors.border }]} />
 
           {step === 4 ? (
@@ -1877,7 +1511,22 @@ export default function PlanScreen() {
   const navigation = useNavigation();
   const colors = useColors();
   const styles = useMemo(() => makeStyles(colors), [colors]);
-  const { user, workoutPlan, setWorkoutPlan, scheduledWorkouts, setScheduledWorkouts } = useStore();
+  const { user, workoutPlan, setWorkoutPlan, scheduledWorkouts, setScheduledWorkouts, planCompletions } = useStore();
+
+  // v1.4.0 — re-schedule per-day workout reminders whenever the plan or the
+  // user's completion state changes. The function is idempotent (cancels
+  // prior plan-day notifs before re-scheduling) and bounded to a 7-day
+  // horizon, so this is cheap to run on every render of these inputs.
+  useEffect(() => {
+    schedulePlanWorkoutReminders(workoutPlan, planCompletions || {});
+  }, [workoutPlan, planCompletions]);
+
+  // Also re-schedule when this screen comes into focus — covers the case
+  // where a day rolled over while the app was backgrounded so today's
+  // reminder gets cleared / tomorrow's gets queued.
+  useFocusEffect(useCallback(() => {
+    schedulePlanWorkoutReminders(workoutPlan, planCompletions || {});
+  }, [workoutPlan, planCompletions]));
 
   const [showCreate,    setShowCreate]    = useState(false);
   const [scrollEnabled, setScrollEnabled] = useState(true);

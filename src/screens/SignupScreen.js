@@ -51,7 +51,7 @@ const GOALS = [
   { id: 'run_10k',      emoji: '🏃', label: 'Run a 10K' },
   { id: 'run_half',     emoji: '🏅', label: 'Run a half marathon' },
   { id: 'run_marathon', emoji: '🏆', label: 'Run a marathon' },
-  { id: 'crossfit',     emoji: '⚡', label: 'Train CrossFit-style' },
+  { id: 'crossfit',     emoji: '⚡', label: 'Train CrossFit' },
   { id: 'hyrox',        emoji: '🔥', label: 'Train for Hyrox' },
   { id: 'lose_weight',  emoji: '🔥', label: 'Lose weight & burn fat' },
   { id: 'build_muscle', emoji: '💪', label: 'Build muscle & strength' },
