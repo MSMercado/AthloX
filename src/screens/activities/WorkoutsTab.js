@@ -15,18 +15,19 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
-  ActivityIndicator, RefreshControl, Alert,
+  ActivityIndicator, RefreshControl, Alert, Modal,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import useColors from '../../lib/useColors';
 import useStore from '../../store/useStore';
 import { listRunActivities } from '../../lib/runActivities';
 
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
 // ── Type → visual mapping ────────────────────────────────────────────────────
 // Each entry: { stripe color, emoji shown in the card icon circle, label
-// used in the type filter chip }. Order here drives the filter chip order.
+// used in the type filter chip }.
 const TYPE_META = {
-  all:      { stripe: null,       emoji: '📋', label: 'All'      },
   run:      { stripe: '#10b981',  emoji: '🏃', label: 'Run'      },
   bike:     { stripe: '#3b82f6',  emoji: '🚴', label: 'Bike'     },
   walk:     { stripe: '#22c55e',  emoji: '🚶', label: 'Walk'     },
@@ -34,8 +35,6 @@ const TYPE_META = {
   strength: { stripe: '#3b82f6',  emoji: '🏋️', label: 'Strength' },
   circuit:  { stripe: '#a855f7',  emoji: '⚡', label: 'Circuit'  },
 };
-
-const FILTER_CHIPS = ['all', 'run', 'bike', 'walk', 'hike', 'strength', 'circuit'];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -175,7 +174,13 @@ export default function WorkoutsTab() {
   const [runs, setRuns]         = useState([]);
   const [loading, setLoading]   = useState(true);
   const [refreshing, setRefresh] = useState(false);
-  const [filter, setFilter]     = useState('all');
+  // v2.0 filters: month + year (null = all). Replaces the workout-type chips
+  // to match Runna's Activities tab and reduce duplication with the per-month
+  // section headers (filtering by type was a tab-bar-like concept; filtering
+  // by date is the natural "find a specific workout" gesture).
+  const [filterYear,  setFilterYear]  = useState(null); // number | null
+  const [filterMonth, setFilterMonth] = useState(null); // 0-11 | null
+  const [openPicker,  setOpenPicker]  = useState(null); // 'year' | 'month' | null
 
   const loadRuns = useCallback(async () => {
     if (!user?.id) { setRuns([]); setLoading(false); return; }
@@ -194,11 +199,29 @@ export default function WorkoutsTab() {
   useFocusEffect(useCallback(() => { loadRuns(); }, [loadRuns]));
 
   // Combined + filtered + grouped.
+  const feed = useMemo(() => mergeFeed(logs || [], runs), [logs, runs]);
+
+  // Years that have any activity — drives the Year picker options.
+  const availableYears = useMemo(() => {
+    const set = new Set(feed.map(i => i.date.getFullYear()));
+    return Array.from(set).sort((a, b) => b - a);
+  }, [feed]);
+
+  // Months that have activity in the currently-selected year (or all years).
+  const availableMonths = useMemo(() => {
+    const inYear = filterYear == null ? feed : feed.filter(i => i.date.getFullYear() === filterYear);
+    const set = new Set(inYear.map(i => i.date.getMonth()));
+    return Array.from(set).sort((a, b) => b - a);
+  }, [feed, filterYear]);
+
   const groups = useMemo(() => {
-    const feed = mergeFeed(logs || [], runs);
-    const filtered = filter === 'all' ? feed : feed.filter(i => i.type === filter);
+    const filtered = feed.filter(i => {
+      if (filterYear  != null && i.date.getFullYear() !== filterYear)  return false;
+      if (filterMonth != null && i.date.getMonth()    !== filterMonth) return false;
+      return true;
+    });
     return groupByMonth(filtered);
-  }, [logs, runs, filter]);
+  }, [feed, filterYear, filterMonth]);
 
   const onCardPress = (item) => {
     if (item.runActivityId) {
@@ -235,34 +258,48 @@ export default function WorkoutsTab() {
         />
       }
     >
-      {/* Filter chips */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipsRow}
-      >
-        {FILTER_CHIPS.map(id => {
-          const isActive = filter === id;
-          return (
-            <TouchableOpacity
-              key={id}
-              onPress={() => setFilter(id)}
-              activeOpacity={0.8}
-              style={[
-                styles.chip,
-                { backgroundColor: isActive ? colors.accent : colors.surface, borderColor: isActive ? colors.accent : colors.border },
-              ]}
-            >
-              <Text style={{
-                color: isActive ? '#fff' : colors.text2,
-                fontWeight: '700', fontSize: 13,
-              }}>
-                {TYPE_META[id].label}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
-      </ScrollView>
+      {/* Month + Year filters */}
+      <View style={styles.filterRow}>
+        <FilterPill
+          label={filterYear  == null ? 'All years'     : String(filterYear)}
+          onPress={() => setOpenPicker('year')}
+          colors={colors}
+        />
+        <FilterPill
+          label={filterMonth == null ? 'All months'    : MONTH_NAMES[filterMonth]}
+          onPress={() => setOpenPicker('month')}
+          colors={colors}
+        />
+        {(filterYear != null || filterMonth != null) && (
+          <TouchableOpacity
+            onPress={() => { setFilterYear(null); setFilterMonth(null); }}
+            style={styles.clearBtn}
+            activeOpacity={0.7}
+          >
+            <Text style={{ color: colors.accent, fontWeight: '700', fontSize: 13 }}>Clear</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Year / Month picker modal */}
+      <PickerModal
+        visible={openPicker === 'year'}
+        title="Year"
+        options={[{ value: null, label: 'All years' }, ...availableYears.map(y => ({ value: y, label: String(y) }))]}
+        selected={filterYear}
+        onSelect={(v) => { setFilterYear(v); setOpenPicker(null); }}
+        onClose={() => setOpenPicker(null)}
+        colors={colors}
+      />
+      <PickerModal
+        visible={openPicker === 'month'}
+        title="Month"
+        options={[{ value: null, label: 'All months' }, ...availableMonths.map(m => ({ value: m, label: MONTH_NAMES[m] }))]}
+        selected={filterMonth}
+        onSelect={(v) => { setFilterMonth(v); setOpenPicker(null); }}
+        onClose={() => setOpenPicker(null)}
+        colors={colors}
+      />
 
       {groups.length === 0 ? (
         <View style={styles.emptyWrap}>
@@ -335,11 +372,70 @@ function Stat({ label, value, colors }) {
   );
 }
 
+function FilterPill({ label, onPress, colors }) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.8}
+      style={{
+        flexDirection: 'row', alignItems: 'center', gap: 6,
+        paddingHorizontal: 14, paddingVertical: 8,
+        borderRadius: 18, borderWidth: 1,
+        borderColor: colors.border, backgroundColor: colors.surface,
+        marginRight: 8,
+      }}
+    >
+      <Text style={{ color: colors.text, fontWeight: '700', fontSize: 13 }}>{label}</Text>
+      <Text style={{ color: colors.text3, fontSize: 10 }}>▼</Text>
+    </TouchableOpacity>
+  );
+}
+
+function PickerModal({ visible, title, options, selected, onSelect, onClose, colors }) {
+  return (
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <TouchableOpacity activeOpacity={1} onPress={onClose} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'flex-end' }}>
+        <TouchableOpacity activeOpacity={1} onPress={() => {}} style={{
+          backgroundColor: colors.surface,
+          borderTopLeftRadius: 22, borderTopRightRadius: 22,
+          paddingTop: 12, paddingBottom: 28,
+          maxHeight: '70%',
+        }}>
+          <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: colors.border, alignSelf: 'center', marginBottom: 12 }} />
+          <Text style={{ color: colors.text, fontSize: 17, fontWeight: '800', textAlign: 'center', marginBottom: 8 }}>{title}</Text>
+          <ScrollView style={{ maxHeight: 360 }}>
+            {options.map((opt, i) => {
+              const isSel = opt.value === selected;
+              return (
+                <TouchableOpacity
+                  key={String(opt.value) + '-' + i}
+                  onPress={() => onSelect(opt.value)}
+                  activeOpacity={0.7}
+                  style={{
+                    paddingVertical: 16, paddingHorizontal: 22,
+                    borderBottomWidth: 1, borderBottomColor: colors.border,
+                    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+                  }}
+                >
+                  <Text style={{ color: isSel ? colors.accent : colors.text, fontSize: 16, fontWeight: isSel ? '800' : '600' }}>
+                    {opt.label}
+                  </Text>
+                  {isSel && <Text style={{ color: colors.accent, fontSize: 18 }}>✓</Text>}
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </Modal>
+  );
+}
+
 const makeStyles = (colors) => StyleSheet.create({
   loadingWrap: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
-  chipsRow:    { paddingHorizontal: 14, paddingVertical: 12, gap: 8 },
-  chip:        { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 18, borderWidth: 1, marginRight: 8 },
+  filterRow:   { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 12 },
+  clearBtn:    { paddingHorizontal: 8, paddingVertical: 6 },
 
   emptyWrap:   { alignItems: 'center', paddingTop: 80, paddingHorizontal: 24 },
   emptyTitle:  { fontSize: 18, fontWeight: '800', marginBottom: 6 },

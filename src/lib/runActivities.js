@@ -30,6 +30,14 @@ function fromRow(row) {
     path:            Array.isArray(row.path)   ? row.path   : [],
     splits:          Array.isArray(row.splits) ? row.splits : [],
     aiInsights:      row.ai_insights,
+    // v2.0 detail-screen columns. All optional — older rows return null.
+    notes:           row.notes        ?? null,
+    location:        row.location     ?? null,
+    prescribed:      row.prescribed   ?? null,
+    shoesId:         row.shoes_id     ?? null,
+    avgHrBpm:        row.avg_hr_bpm   ?? null,
+    maxHrBpm:        row.max_hr_bpm   ?? null,
+    avgCadence:      row.avg_cadence  ?? null,
     createdAt:       row.created_at,
   };
 }
@@ -49,6 +57,16 @@ function toRow(activity, userId) {
     path:                    Array.isArray(activity.path)   ? activity.path   : [],
     splits:                  Array.isArray(activity.splits) ? activity.splits : [],
     ai_insights:             activity.aiInsights || null,
+    // v2.0 detail-screen columns. Anything optional — omit fields the run
+    // doesn't carry rather than nulling them, so a row created before the
+    // migration isn't accidentally cleared.
+    ...(activity.notes        != null && { notes:        activity.notes        }),
+    ...(activity.location     != null && { location:     activity.location     }),
+    ...(activity.prescribed   != null && { prescribed:   activity.prescribed   }),
+    ...(activity.shoesId      != null && { shoes_id:     activity.shoesId      }),
+    ...(activity.avgHrBpm     != null && { avg_hr_bpm:   activity.avgHrBpm     }),
+    ...(activity.maxHrBpm     != null && { max_hr_bpm:   activity.maxHrBpm     }),
+    ...(activity.avgCadence   != null && { avg_cadence:  activity.avgCadence   }),
   };
 }
 

@@ -205,6 +205,13 @@ export default function TrackScreen({ route }) {
     }
   }, [route?.params?.startRun, route?.params?.startRunAt]);
 
+  // v2.0 — prescribed workout description from the plan day. Stored on the
+  // run_activities row so RunSummary's Description section can show it.
+  const prescribedRef = useRef(null);
+  React.useEffect(() => {
+    if (route?.params?.prescribed) prescribedRef.current = route.params.prescribed;
+  }, [route?.params?.prescribed, route?.params?.startRunAt]);
+
   /* ─ Core state ─ */
   const [mode, setMode]           = useState('home');
   const [selR, setSelR]           = useState(null);
@@ -664,6 +671,9 @@ export default function TrackScreen({ route }) {
         calories:        gpsCal,
         path,
         splits,
+        // v2.0 — if the run was launched from a plan day, include the
+        // prescribed description so the summary screen can render it.
+        ...(prescribedRef.current ? { prescribed: prescribedRef.current } : {}),
       };
       saveRunActivity(activity)
         .then(saved => {

@@ -1642,9 +1642,18 @@ export default function PlanScreen() {
           if (circuitTypes.includes(routine.dayType)) {
             navigation.navigate('CircuitTimer', { routine });
           } else if (routine.type === 'cardio') {
+            // Build a short "prescribed" description so the run-summary screen
+            // can show what the plan called for. RunSummary renders this in
+            // the Description section.
+            const prescribed = [
+              routine.name,
+              ...((routine.exercises || []).map(e =>
+                `• ${e.name}${e.duration ? ` · ${e.duration}` : ''}${e.distance ? ` · ${e.distance}` : ''}${e.pace ? ` · ${e.pace}` : ''}${e.rest ? ` · rest ${e.rest}` : ''}`
+              )),
+            ].filter(Boolean).join('\n');
             // Pass a fresh timestamp so the param reference always changes —
             // re-tapping Start Workout re-triggers the autostart effect.
-            navigation.navigate('Workout', { startRun: 'run', startRunAt: Date.now() });
+            navigation.navigate('Workout', { startRun: 'run', startRunAt: Date.now(), prescribed });
           } else {
             navigation.navigate('Workout', { startRoutine: routine });
           }
