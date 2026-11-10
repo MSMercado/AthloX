@@ -179,7 +179,7 @@ eas build --platform android --profile production
 
 ## Author
 
-Built by Julie — solo founder, product designer, and developer.
+Built by M Steven Mercado — solo founder, product designer, and developer.
 
 > "Train Like an Athlete. Not Like Everyone Else."
 
