@@ -20,7 +20,10 @@
         "NSLocationWhenInUseUsageDescription": "AthloX uses your location to track your runs, rides and hikes.",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "AthloX uses your location in the background to keep tracking your activity even when the screen is off.",
         "NSLocationAlwaysUsageDescription": "AthloX uses your location in the background to keep tracking your activity even when the screen is off.",
-        "UIBackgroundModes": ["location", "fetch"]
+        "UIBackgroundModes": [
+          "location",
+          "fetch"
+        ]
       }
     },
     "android": {
@@ -72,7 +75,16 @@
           "cameraPermission": "AthloX needs camera access to take photos for your posts."
         }
       ],
-      "react-native-health-connect"
+      "react-native-health-connect",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ],
+      "./plugins/withHealthConnectAndroid"
     ],
     "web": {
       "favicon": "./assets/favicon.png"

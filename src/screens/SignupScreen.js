@@ -13,7 +13,7 @@ import {
   sanitiseUsernameInput,
   validateUsername,
   checkUsernameAvailable,
-  defaultUsernameFromEmail,
+  defaultUsernameFromName,
 } from '../lib/usernames';
 
 const { width } = Dimensions.get('window');
@@ -673,16 +673,17 @@ export default function SignupScreen({ onBack, onSwitch }) {
     }, 400);
   };
 
-  // Pre-fill the username field from the email prefix when the user reaches
-  // the username step. They can keep the suggestion or type their own.
+  // Pre-fill the username field from the user's name when they reach the
+  // username step. Not from the email: usernames are public on Community and
+  // an email-prefix username lets anyone guess the email address.
   useEffect(() => {
     if (form.username) return;
-    if (!form.email) return;
-    const suggested = defaultUsernameFromEmail(form.email);
+    if (!form.name) return;
+    const suggested = defaultUsernameFromName(form.name);
     if (suggested && !validateUsername(suggested)) {
       onUsernameChange(suggested);
     }
-  }, [form.email, step]);
+  }, [form.name, step]);
 
   const animateNext = (dir = 1) => {
     slideAnim.setValue(dir * width);

@@ -46,6 +46,21 @@ export function sanitiseUsernameInput(input) {
  * suffix (this function doesn't loop — that's the caller's responsibility,
  * since they have the Supabase client).
  */
+export function defaultUsernameFromName(name) {
+  if (!name) return null;
+  const stem = String(name)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9_]/g, '');
+  if (stem.length < MIN_LEN) return null;
+  return stem.slice(0, MAX_LEN);
+}
+
+/**
+ * @deprecated Don't use for anything public. A username derived from the
+ * email prefix lets anyone on Community guess the user's email address.
+ * Kept only so older imports don't break; use defaultUsernameFromName.
+ */
 export function defaultUsernameFromEmail(email) {
   if (!email) return null;
   const stem = email
@@ -104,13 +119,18 @@ export async function setUsername(userId, username) {
  * digits if the stem is already taken. Capped at 5 attempts; caller should
  * handle null by falling back to whatever onboarding flow they prefer.
  */
-export async function pickAvailableDefault(email, userId) {
-  const stem = defaultUsernameFromEmail(email);
-  if (!stem) return null;
+export async function pickAvailableDefault(displayName, userId) {
+  // Built from the user's display name, never their email: usernames are
+  // public on Community, and an email-prefix username gives away the email.
+  const nameStem = defaultUsernameFromName(displayName);
+  const stem = nameStem || 'athlete';
 
-  // First try the bare stem
-  const first = await checkUsernameAvailable(stem, userId);
-  if (first.available) return stem;
+  // First try the bare stem (only when it came from their name — a bare
+  // "athlete" is never going to be free and isn't meaningful anyway)
+  if (nameStem) {
+    const first = await checkUsernameAvailable(stem, userId);
+    if (first.available) return stem;
+  }
 
   // Then stem + 2/3/4-digit numeric suffix
   for (let i = 0; i < 5; i++) {

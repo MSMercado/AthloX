@@ -31,8 +31,9 @@ export function timeAgo(ts) {
 export async function ensureProfileComplete(user) {
   if (!user?.id) return;
   const meta = user.user_metadata || {};
-  const fallbackName = (meta.full_name || meta.name || user.email?.split('@')[0] || '').trim();
-  if (!fallbackName) return;
+  // Never fall back to the email prefix: names and usernames are public on
+  // Community, and an email prefix gives away the user's email address.
+  const fallbackName = (meta.full_name || meta.name || meta.display_name || 'Athlete').trim();
 
   // Only touch the row if fields are currently blank — don't overwrite user edits.
   const { data: existing } = await supabase
@@ -43,7 +44,7 @@ export async function ensureProfileComplete(user) {
 
   if (!existing) {
     // No profile row at all — create one with everything we know
-    const username = await pickAvailableDefault(user.email, user.id);
+    const username = await pickAvailableDefault(meta.full_name || meta.name || meta.display_name, user.id);
     // Note: do NOT include `email` here — the column doesn't exist on
     // `profiles`. Email lives in `auth.users` and is joined when needed.
     // Including it caused silent insert failures (Postgres rejects unknown
@@ -61,10 +62,10 @@ export async function ensureProfileComplete(user) {
   if (!existing.name || existing.name.trim() === '') {
     patch.name = fallbackName;
   }
-  // v1.2.0 backfill: every account needs a @username. Auto-generate from email
+  // v1.2.0 backfill: every account needs a @username. Auto-generate from their name
   // for any legacy account that doesn't have one yet.
   if (!existing.username) {
-    const username = await pickAvailableDefault(user.email, user.id);
+    const username = await pickAvailableDefault(meta.full_name || meta.name || meta.display_name, user.id);
     if (username) patch.username = username;
   }
   if (Object.keys(patch).length > 0) {

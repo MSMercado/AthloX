@@ -1,8 +1,10 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, TextInput,
-  StyleSheet, Alert, ActivityIndicator, Modal, Switch, Image,
+  StyleSheet, Alert, ActivityIndicator, Modal, Switch, Image, Linking, Platform,
 } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
+import { SUPPORT_EMAIL, PRIVACY_POLICY_URL } from '../lib/links';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
@@ -22,6 +24,35 @@ import appJson from '../../app.json';
 // Single source of truth for the displayed app version — reads app.json's
 // expo.version so the Settings screen never drifts from the real build.
 const APP_VERSION = appJson?.expo?.version || '1.0.0';
+
+// Opens the user's email app with a pre-filled feedback message. Falls back
+// to showing the address if no email app is set up.
+async function sendFeedback() {
+  const subject = encodeURIComponent(`AthloX feedback (v${APP_VERSION})`);
+  const body = encodeURIComponent(
+    `\n\n---\nApp version: ${APP_VERSION}\nPlatform: ${Platform.OS} ${Platform.Version}`,
+  );
+  const url = `mailto:${SUPPORT_EMAIL}?subject=${subject}&body=${body}`;
+  try {
+    await Linking.openURL(url);
+  } catch {
+    Alert.alert('Send feedback', `Email us at ${SUPPORT_EMAIL} — we read every message.`);
+  }
+}
+
+async function openPrivacyPolicy() {
+  if (PRIVACY_POLICY_URL) {
+    try {
+      await WebBrowser.openBrowserAsync(PRIVACY_POLICY_URL);
+      return;
+    } catch { /* fall through to the summary below */ }
+  }
+  Alert.alert(
+    'Privacy Policy',
+    'AthloX stores your account, workouts and GPS routes securely with Supabase, and never sells your data. ' +
+    `For the full policy or any privacy request, email ${SUPPORT_EMAIL}.`,
+  );
+}
 
 const LEVEL_COLORS = {
   Beginner:     { bg: '#f0fdf4', text: '#10b981' },
@@ -227,8 +258,8 @@ function SettingsModal({ visible, onClose, user, onLogout, loggingOut, onDeleteA
           <Text style={styles.settingGroupLabel}>Support</Text>
           <View style={styles.settingCard}>
             <SettingRow icon="⭐" label="Rate AthloX" onPress={() => Alert.alert('Thank you!', 'Rating will be available when the app is published.')} />
-            <SettingRow icon="💬" label="Send feedback" onPress={() => Alert.alert('Feedback', 'Coming soon!')} />
-            <SettingRow icon="📄" label="Privacy Policy" onPress={() => Alert.alert('Privacy Policy', 'Coming soon!')} noBorder />
+            <SettingRow icon="💬" label="Send feedback" onPress={sendFeedback} />
+            <SettingRow icon="📄" label="Privacy Policy" onPress={openPrivacyPolicy} noBorder />
           </View>
 
           {/* App Info */}

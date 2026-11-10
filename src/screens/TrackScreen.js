@@ -15,6 +15,7 @@ import {
   resumeRunTracking,
   resetRunTracking,
   getTrackingState,
+  createDistanceFilter,
 } from '../lib/runTracking';
 import useStore from '../store/useStore';
 import { XP_REWARDS, computeStrengthXP, computeCardioXP } from '../lib/xp';
@@ -251,6 +252,8 @@ export default function TrackScreen({ route }) {
   const watchRef    = useRef(null);
   const distRef     = useRef(0);
   const lastPosRef  = useRef(null);
+  const distFilterRef = useRef(null);
+  if (!distFilterRef.current) distFilterRef.current = createDistanceFilter();
   const pausedRef   = useRef(false);
   const modeRef     = useRef(mode);
   const countdownAnim = useRef(new Animated.Value(1)).current;
@@ -367,19 +370,19 @@ export default function TrackScreen({ route }) {
       drainedIdxRef.current = points.length;
       for (const p of fresh) {
         const newPos = { lat: p.lat, lng: p.lng };
-        if (lastPosRef.current) {
-          const d = haversine(lastPosRef.current.lat, lastPosRef.current.lng, newPos.lat, newPos.lng);
-          // Same noise filter as v1.1.0 — drop suspicious large jumps
-          if (d < 0.1) {
-            distRef.current += d;
-          }
-        }
+        // Filtered distance (see createDistanceFilter): stops GPS wobble
+        // from adding phantom metres. lastPosRef is set to null on start,
+        // resume and reset, which we use as the signal to restart the filter.
+        if (!lastPosRef.current) distFilterRef.current.reset();
+        distRef.current += distFilterRef.current.push(p);
         lastPosRef.current = newPos;
-        // Mirror into the post-run summary path buffer
+        // Mirror into the post-run summary path buffer. `accuracy` is kept
+        // so the Kalman smoother can weight each fix by how reliable it is.
         pathRef.current.push({
           lat: p.lat, lng: p.lng,
           alt: p.alt,
           ts:  p.ts,
+          accuracy: p.accuracy,
         });
         // Rolling 30-second pace window
         const now = p.ts;

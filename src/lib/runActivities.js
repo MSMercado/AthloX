@@ -258,9 +258,15 @@ export function smoothPathKalman(path, { processNoiseM2PerS = 9 } = {}) {
   let estVar = (first.accuracy ?? defAcc) ** 2;
   let lastTs = first.ts;
 
-  const out = [{ ...first }];
+  // Forward pass. Store filtered estimates + variances so the backward pass
+  // can use them.
+  const n = path.length;
+  const fx = new Array(n), fy = new Array(n);   // filtered positions
+  const fVar = new Array(n);                    // filtered variance
+  const pVar = new Array(n);                    // predicted variance (before update)
+  fx[0] = estX; fy[0] = estY; fVar[0] = estVar; pVar[0] = estVar;
 
-  for (let i = 1; i < path.length; i++) {
+  for (let i = 1; i < n; i++) {
     const p = path[i];
     const { x, y } = toXY(p);
     const measVar = (p.accuracy ?? defAcc) ** 2;
@@ -268,6 +274,7 @@ export function smoothPathKalman(path, { processNoiseM2PerS = 9 } = {}) {
 
     // Predict step — variance grows by process noise * dt
     estVar += processNoiseM2PerS * dt;
+    pVar[i] = estVar;
 
     // Update step — Kalman gain
     const K = estVar / (estVar + measVar);
@@ -275,12 +282,26 @@ export function smoothPathKalman(path, { processNoiseM2PerS = 9 } = {}) {
     estY = estY + K * (y - estY);
     estVar = (1 - K) * estVar;
 
-    const { lat, lng } = toLatLng(estX, estY);
-    out.push({ ...p, lat, lng });
+    fx[i] = estX; fy[i] = estY; fVar[i] = estVar;
     lastTs = p.ts;
   }
 
-  return out;
+  // Backward pass (Rauch–Tung–Striebel smoother). A forward-only filter lags
+  // behind the runner, so the drawn route cut inside every corner and sat
+  // a few metres off the real path. Running back over the data with the
+  // future fixes pulls each point back onto where the runner actually was,
+  // keeping the smoothness without the lag. (Strava-style post-processing.)
+  const sx = fx.slice(), sy = fy.slice();
+  for (let i = n - 2; i >= 0; i--) {
+    const C = fVar[i] / pVar[i + 1];
+    sx[i] = fx[i] + C * (sx[i + 1] - fx[i]);
+    sy[i] = fy[i] + C * (sy[i + 1] - fy[i]);
+  }
+
+  return path.map((p, i) => {
+    const { lat, lng } = toLatLng(sx[i], sy[i]);
+    return { ...p, lat, lng };
+  });
 }
 
 /** Haversine distance in km between two points. */

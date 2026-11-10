@@ -31,7 +31,7 @@ const USING_CUSTOM_ICONS = true;
 const TAB_ICONS = USING_CUSTOM_ICONS ? {
   Dashboard:  require('../../assets/tab-today.png'),
   Plan:       require('../../assets/tab-plan.png'),
-  Activities: require('../../assets/tab-workouts.png'), // TODO: dedicated icon
+  Activities: require('../../assets/tab-workouts.png'), // stopwatch + dumbbell fits Activities (workouts + runs)
   Social:     require('../../assets/tab-community.png'),
   Coach:      require('../../assets/tab-coach.png'),
 } : null;
